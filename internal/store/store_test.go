@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/villagelabsco/agent-inbox/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 func openTestDB(t *testing.T) *DB {

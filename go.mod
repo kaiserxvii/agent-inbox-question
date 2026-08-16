@@ -1,4 +1,4 @@
-module github.com/villagelabsco/agent-inbox
+module github.com/villagelabsco/agent-inbox-question
 
 go 1.25.0
 

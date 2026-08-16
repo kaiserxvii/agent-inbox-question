@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/villagelabsco/agent-inbox/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 func (a *App) RunList(args []string) error {

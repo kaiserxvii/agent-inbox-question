@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/villagelabsco/agent-inbox/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 func testApp(t *testing.T) *App {

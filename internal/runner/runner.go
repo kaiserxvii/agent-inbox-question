@@ -6,9 +6,9 @@ import (
 	"io"
 	"strings"
 
-	"github.com/villagelabsco/agent-inbox/internal/agent"
-	"github.com/villagelabsco/agent-inbox/internal/domain"
-	"github.com/villagelabsco/agent-inbox/internal/store"
+	"github.com/villagelabsco/agent-inbox-question/internal/agent"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/store"
 )
 
 type Deps struct {

@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/villagelabsco/agent-inbox/internal/domain"
-	"github.com/villagelabsco/agent-inbox/internal/store"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/store"
 )
 
 func setupTest(t *testing.T) (Deps, *store.TaskRepo, *store.RunRepo, *store.CommentRepo) {

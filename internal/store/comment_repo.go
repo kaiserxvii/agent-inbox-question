@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/villagelabsco/agent-inbox/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 type CommentRepo struct {

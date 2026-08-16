@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/villagelabsco/agent-inbox/internal/cli"
+	"github.com/villagelabsco/agent-inbox-question/internal/cli"
 )
 
 const usage = `Usage: agent-inbox <command> [flags]

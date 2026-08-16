@@ -7,13 +7,33 @@ more work you send it back with feedback and it runs again.
 There is no real LLM — the agent is simulated deterministically so the tool is
 fully self-contained, reproducible, and needs no credentials.
 
-## Install
+## Getting started
 
-```
-go build -o bin/agent-inbox ./cmd/agent-inbox
+Requirements: Go 1.22 or newer. There are no other dependencies — no API keys,
+no services, no database to set up (SQLite is embedded via a pure-Go driver).
+
+```bash
+git clone https://github.com/villagelabsco/agent-inbox-question.git
+cd agent-inbox-question
+make build          # builds ./bin/agent-inbox
+make test           # go test ./...
+make smoke          # end-to-end exercise against a temp data dir
 ```
 
-Or via `make build`.
+Then run your first task:
+
+```bash
+./bin/agent-inbox add "my first task" -d "try the thing out"
+./bin/agent-inbox work
+./bin/agent-inbox show 1
+```
+
+State lives in `~/.agent-inbox` by default. To keep experiments isolated, point
+the tool at a throwaway directory:
+
+```bash
+export AGENT_INBOX_DATA_DIR=$(mktemp -d)
+```
 
 ## Usage
 

@@ -3,7 +3,7 @@ package cli
 import (
 	"fmt"
 
-	"github.com/villagelabsco/agent-inbox/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 func (a *App) RunStatus() error {

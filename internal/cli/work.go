@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/villagelabsco/agent-inbox/internal/domain"
-	"github.com/villagelabsco/agent-inbox/internal/runner"
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
+	"github.com/villagelabsco/agent-inbox-question/internal/runner"
 )
 
 func (a *App) RunWork(ctx context.Context) error {

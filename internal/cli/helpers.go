@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/villagelabsco/agent-inbox/internal/store"
+	"github.com/villagelabsco/agent-inbox-question/internal/store"
 )
 
 type App struct {
