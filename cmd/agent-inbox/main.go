@@ -89,6 +89,10 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	if ctx.Err() != nil {
+		fmt.Fprintln(os.Stderr, "interrupted")
+		return 130
+	}
 	return 0
 }
 
