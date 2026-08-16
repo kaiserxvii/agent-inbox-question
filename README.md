@@ -46,7 +46,7 @@ $ agent-inbox add "broken feature" -d "attempt this [fail-at:2]"
 2
 
 # Add a task that will exhaust its token budget
-$ agent-inbox add "huge refactor" -d "rewrite everything [steps:20]"
+$ agent-inbox add "huge refactor" -d "rewrite everything [steps:30]"
 3
 
 # Work through all tasks
@@ -92,7 +92,7 @@ agent's behavior:
 |---------------|-----------------------------------------------------|
 | `[steps:N]`   | Force the agent plan to have exactly N steps         |
 | `[fail-at:N]` | The agent errors at step N                           |
-| `[budget:N]`  | Override the agent's token budget (default: 1200)    |
+| `[budget:N]`  | Override the agent's token budget (default: 3500)    |
 
 Directives are composable: `[steps:20] [budget:500]` creates a 20-step task
 that will exhaust its budget partway through.

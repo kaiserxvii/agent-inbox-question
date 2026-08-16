@@ -15,6 +15,10 @@ import (
 	"time"
 )
 
+// DefaultTokenBudget covers the worst-case default plan (8 steps at 400 tokens
+// plus one feedback step at 300), so a task without directives always finishes.
+const DefaultTokenBudget = 3500
+
 type OutcomeKind int
 
 const (
@@ -85,7 +89,7 @@ func Start(dataDir, taskTitle, taskDescription string, feedback []string, opts .
 		stepCount = v
 	}
 
-	budget := 1200
+	budget := DefaultTokenBudget
 	if v, ok := directives["budget"]; ok {
 		budget = v
 	}
@@ -131,7 +135,7 @@ func Load(dataDir, sessionID string, opts ...Option) (*Session, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("parse session %s: %w", sessionID, err)
 	}
-	state.TokenBudget = state.TokenBudget - state.TokensUsed + 1200
+	state.TokenBudget = state.TokenBudget - state.TokensUsed + DefaultTokenBudget
 	state.TokensUsed = 0
 	state.BudgetHalted = false
 
