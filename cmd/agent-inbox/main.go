@@ -20,7 +20,6 @@ Commands:
   show <id>                        Show task details, runs, and output
   run <id>                         Execute a todo task
   work                             Execute all todo tasks in order
-  continue <id> -m <feedback>      Continue a done task with feedback
   status                           Show task counts by status
 
 Global flags:
@@ -75,8 +74,6 @@ func run() int {
 		err = app.RunRun(ctx, cmdArgs)
 	case "work":
 		err = app.RunWork(ctx)
-	case "continue":
-		err = app.RunContinue(ctx, cmdArgs)
 	case "status":
 		err = app.RunStatus()
 	default:

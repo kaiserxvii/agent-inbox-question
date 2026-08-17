@@ -82,7 +82,6 @@ var (
 var allowedTransitions = map[TaskStatus]map[TaskStatus]bool{
 	TaskTodo:       {TaskInProgress: true},
 	TaskInProgress: {TaskDone: true, TaskFailed: true},
-	TaskDone:       {TaskInProgress: true},
 }
 
 func Transition(from, to TaskStatus) error {

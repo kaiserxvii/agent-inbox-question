@@ -1,8 +1,8 @@
 # agent-inbox
 
 A task inbox for AI agents. You add tasks; a runner executes them one at a time
-by driving a simulated agent; you review the output; if a finished task needs
-more work you send it back with feedback and it runs again.
+by driving a simulated agent; you review the output. Every task terminates in
+`done` or `failed`.
 
 There is no real LLM — the agent is simulated deterministically so the tool is
 fully self-contained, reproducible, and needs no credentials.
@@ -45,7 +45,6 @@ Commands:
   show <id>                        Show task details, runs, and output
   run <id>                         Execute a todo task
   work                             Execute all todo tasks in order
-  continue <id> -m <feedback>      Continue a done task with feedback
   status                           Show task counts by status
 
 Global flags:
@@ -95,11 +94,6 @@ in_progress  0
 done         1
 failed       2
 total        3
-
-# Send a done task back with feedback
-$ agent-inbox continue 1 -m "add refresh token support"
-[step 1/7] revise per feedback: "add refresh token support": processed
-...
 ```
 
 ## Directives
@@ -129,34 +123,6 @@ Override with `--data-dir` or `AGENT_INBOX_DATA_DIR`.
 
 ## Design notes
 
-### Task state machine
-
-```
-                ┌──────────────┐
-                │     todo     │
-                └──────┬───────┘
-                       │ claim
-                       v
-                ┌──────────────┐
-         ┌──────│ in_progress  │──────┐
-         │      └──────────────┘      │
-         │ success              error/exhaustion
-         v                            v
-  ┌──────────────┐           ┌──────────────┐
-  │     done     │           │    failed    │
-  └──────┬───────┘           └──────────────┘
-         │ continue                (terminal)
-         └───────────────────────────┐
-                                     v
-                              ┌──────────────┐
-                              │ in_progress  │
-                              └──────────────┘
-```
-
-Transitions are enforced in a single chokepoint (`domain.Transition`). The store
-uses compare-and-swap (`UPDATE ... WHERE status = ?`) to prevent concurrent
-claims.
-
 ### Package map
 
 ```
@@ -175,9 +141,9 @@ no uuid lib, no test framework — standard library only beyond the database dri
 
 ## Known limitations
 
-- Failed tasks cannot be re-run and must be recreated. When a session exhausts
-  its token budget, completed-step output is kept but the work cannot be picked
-  back up.
+- Tasks end in `done` or `failed`, and both are final. A failed task must be
+  recreated from scratch; when a session exhausts its token budget, completed-step
+  output is kept but the work cannot be picked back up.
 - Only one task can be in progress at a time; there is no concurrent execution.
 - The simulated agent is deterministic — the same task title and description
   always produce the same plan and step costs.

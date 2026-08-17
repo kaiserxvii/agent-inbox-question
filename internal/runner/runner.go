@@ -20,32 +20,21 @@ type Deps struct {
 	NoDelay  bool
 }
 
-func Execute(ctx context.Context, deps Deps, taskID int64, fromStatus domain.TaskStatus) error {
+func Execute(ctx context.Context, deps Deps, taskID int64) error {
 	task, err := deps.Tasks.Get(taskID)
 	if err != nil {
 		return fmt.Errorf("get task %d: %w", taskID, err)
 	}
 
-	if err := deps.Tasks.Transition(taskID, fromStatus, domain.TaskInProgress); err != nil {
+	if err := deps.Tasks.Transition(taskID, domain.TaskTodo, domain.TaskInProgress); err != nil {
 		return err
-	}
-
-	var feedback []string
-	comments, err := deps.Comments.ListByTask(taskID)
-	if err != nil {
-		return fmt.Errorf("list comments: %w", err)
-	}
-	for _, c := range comments {
-		if c.Author == "user" {
-			feedback = append(feedback, c.Body)
-		}
 	}
 
 	var opts []agent.Option
 	if deps.NoDelay {
 		opts = append(opts, agent.WithNoDelay())
 	}
-	session, err := agent.Start(deps.DataDir, task.Title, task.Description, feedback, opts...)
+	session, err := agent.Start(deps.DataDir, task.Title, task.Description, nil, opts...)
 	if err != nil {
 		deps.Tasks.Transition(taskID, domain.TaskInProgress, domain.TaskFailed)
 		return fmt.Errorf("start agent session: %w", err)

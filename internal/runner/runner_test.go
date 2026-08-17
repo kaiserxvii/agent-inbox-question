@@ -39,7 +39,7 @@ func TestExecuteSuccess(t *testing.T) {
 
 	task, _ := tasks.Create("success task", "[steps:3] [budget:5000]")
 
-	err := Execute(context.Background(), deps, task.ID, domain.TaskTodo)
+	err := Execute(context.Background(), deps, task.ID)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestExecuteFailAt(t *testing.T) {
 
 	task, _ := tasks.Create("fail task", "[steps:5] [fail-at:2] [budget:5000]")
 
-	Execute(context.Background(), deps, task.ID, domain.TaskTodo)
+	Execute(context.Background(), deps, task.ID)
 
 	got, _ := tasks.Get(task.ID)
 	if got.Status != domain.TaskFailed {
@@ -118,7 +118,7 @@ func TestExecuteTokenExhaustion(t *testing.T) {
 
 	task, _ := tasks.Create("exhaust task", "[steps:10] [budget:1]")
 
-	Execute(context.Background(), deps, task.ID, domain.TaskTodo)
+	Execute(context.Background(), deps, task.ID)
 
 	got, _ := tasks.Get(task.ID)
 	if got.Status != domain.TaskFailed {
@@ -144,7 +144,7 @@ func TestExecuteConflict(t *testing.T) {
 	task, _ := tasks.Create("contested", "")
 	tasks.Transition(task.ID, domain.TaskTodo, domain.TaskInProgress)
 
-	err := Execute(context.Background(), deps, task.ID, domain.TaskTodo)
+	err := Execute(context.Background(), deps, task.ID)
 	if err == nil {
 		t.Fatal("expected conflict error")
 	}

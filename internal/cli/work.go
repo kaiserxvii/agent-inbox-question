@@ -40,7 +40,7 @@ func (a *App) RunWork(ctx context.Context) error {
 		total++
 		fmt.Fprintf(os.Stderr, ">>> Running task #%d: %s\n", task.ID, task.Title)
 
-		err = runner.Execute(ctx, deps, task.ID, domain.TaskTodo)
+		err = runner.Execute(ctx, deps, task.ID)
 
 		updated, _ := a.Tasks.Get(task.ID)
 		if updated != nil && updated.Status == domain.TaskDone {

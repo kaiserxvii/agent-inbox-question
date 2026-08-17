@@ -6,7 +6,6 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 	"github.com/villagelabsco/agent-inbox-question/internal/runner"
 )
 
@@ -27,5 +26,5 @@ func (a *App) RunRun(ctx context.Context, args []string) error {
 		Output:   os.Stdout,
 	}
 
-	return runner.Execute(ctx, deps, id, domain.TaskTodo)
+	return runner.Execute(ctx, deps, id)
 }
