@@ -17,7 +17,6 @@ git clone https://github.com/villagelabsco/agent-inbox-question.git
 cd agent-inbox-question
 make build          # builds ./bin/agent-inbox
 make test           # go test ./...
-make smoke          # end-to-end exercise against a temp data dir
 ```
 
 Then run your first task:

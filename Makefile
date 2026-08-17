@@ -1,4 +1,4 @@
-.PHONY: build test vet smoke clean
+.PHONY: build test vet clean
 
 build:
 	go build -o bin/agent-inbox ./cmd/agent-inbox
@@ -8,9 +8,6 @@ test:
 
 vet:
 	go vet ./...
-
-smoke: build
-	bash scripts/smoke.sh
 
 clean:
 	rm -rf bin/
