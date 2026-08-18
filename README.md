@@ -152,18 +152,20 @@ no uuid lib, no test framework — standard library only beyond the database dri
 ### Resume model
 
 A task and an agent session span one or more runs. A run is a single attempt.
-`resume` loads the latest run's session without mutating it, explicitly begins a
-new budget window, then atomically claims the `failed` task and inserts the new
-`running` run before driving the remaining steps. Earlier runs are append-only,
-and `show` groups each run with the output produced by that attempt.
+`resume` snapshots the task status and latest terminal run in one database
+statement, loads that run's session without mutating it, explicitly begins a new
+budget window, then atomically claims the `failed` task and inserts the new
+`running` run before driving the remaining steps. A running run is never accepted
+as a resume predecessor. Earlier runs are append-only, and `show` groups each run
+with the output produced by that attempt.
 
 Attempt start is one SQLite transaction: it compare-and-swaps the task to
 `in_progress` and inserts the owning run. If either write fails, neither is kept.
 If two callers try to resume the same task, exactly one claims it; the other gets a
 typed conflict containing the status observed by the transaction. Resume also binds
-the claim to the run it loaded, so a fast retry cannot consume the failure produced
-by another concurrent invocation. The same attempt operation is used for initial
-execution and resume.
+the claim to the terminal run captured in its status snapshot, so a fast retry
+cannot consume the failure produced by another concurrent invocation. The same
+attempt operation is used for initial execution and resume.
 
 At the end of an attempt, the run outcome, task transition, and optional success
 comment are committed in one transaction. Callers supply one terminal attempt

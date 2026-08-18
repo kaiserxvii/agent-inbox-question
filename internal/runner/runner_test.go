@@ -33,7 +33,6 @@ func setupTest(t *testing.T) (Deps, *store.TaskRepo, *store.RunRepo, *store.Comm
 	deps := Deps{
 		DataDir:  dir,
 		Tasks:    tasks,
-		Runs:     runs,
 		Attempts: store.NewAttemptRepo(db),
 		Output:   &bytes.Buffer{},
 		Options:  Options{NoDelay: true},
@@ -400,7 +399,6 @@ func TestExecuteReportsAttemptFinalizationFailure(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	tasks := store.NewTaskRepo(db)
-	runs := store.NewRunRepo(db)
 
 	task, err := tasks.Create("finalization failure", "[steps:1] [budget:5000]")
 	if err != nil {
@@ -413,7 +411,6 @@ func TestExecuteReportsAttemptFinalizationFailure(t *testing.T) {
 	deps := Deps{
 		DataDir:  dir,
 		Tasks:    tasks,
-		Runs:     runs,
 		Attempts: store.NewAttemptRepo(db),
 		Output:   output,
 		Options:  Options{NoDelay: true},

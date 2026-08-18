@@ -306,6 +306,109 @@ func TestStartAttemptRejectsAResumeOfAnAlreadyConsumedRun(t *testing.T) {
 	}
 }
 
+func TestResumeCandidateSnapshotRejectsAConcurrentRefailure(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	first, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1)
+	if err != nil {
+		t.Fatalf("first StartAttempt: %v", err)
+	}
+	if err := attempts.FinishAttempt(FinishAttemptParams{
+		RunID: first.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+	}); err != nil {
+		t.Fatalf("first FinishAttempt: %v", err)
+	}
+
+	type snapshotResult struct {
+		status    domain.TaskStatus
+		runID     int64
+		sessionID string
+		exit      domain.ExitReason
+		err       error
+	}
+	snapshotReady := make(chan snapshotResult, 1)
+	releaseStaleCaller := make(chan struct{})
+	staleResult := make(chan error, 1)
+	go func() {
+		candidate, err := attempts.GetResumeCandidate(task.ID)
+		if err != nil {
+			snapshotReady <- snapshotResult{err: err}
+			return
+		}
+		snapshotReady <- snapshotResult{
+			status:    candidate.TaskStatus,
+			runID:     candidate.RunID,
+			sessionID: candidate.SessionID,
+			exit:      candidate.ExitReason,
+		}
+		<-releaseStaleCaller
+		_, err = attempts.StartAttempt(
+			task.ID,
+			domain.TaskFailed,
+			candidate.RunID,
+			candidate.SessionID,
+			1,
+		)
+		staleResult <- err
+	}()
+
+	captured := <-snapshotReady
+	if captured.err != nil {
+		t.Fatalf("GetResumeCandidate: %v", captured.err)
+	}
+	if captured.status != domain.TaskFailed || captured.runID != first.ID ||
+		captured.sessionID != "session" || captured.exit != domain.ExitTokenBudgetExhausted {
+		t.Fatalf(
+			"captured candidate = (%q, %d, %q, %q), want failed run %d",
+			captured.status,
+			captured.runID,
+			captured.sessionID,
+			captured.exit,
+			first.ID,
+		)
+	}
+
+	second, err := attempts.StartAttempt(task.ID, domain.TaskFailed, first.ID, "session", 1)
+	if err != nil {
+		t.Fatalf("concurrent StartAttempt: %v", err)
+	}
+	if err := attempts.FinishAttempt(FinishAttemptParams{
+		RunID: second.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+	}); err != nil {
+		t.Fatalf("concurrent FinishAttempt: %v", err)
+	}
+	close(releaseStaleCaller)
+
+	err = <-staleResult
+	var conflict *domain.TaskStatusConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("stale caller error = %v, want TaskStatusConflict", err)
+	}
+	if conflict.ExpectedRunID != first.ID || conflict.ObservedRunID != second.ID {
+		t.Errorf(
+			"conflicting runs = expected %d, observed %d; want %d and %d",
+			conflict.ExpectedRunID,
+			conflict.ObservedRunID,
+			first.ID,
+			second.ID,
+		)
+	}
+	count, err := runs.CountByTask(task.ID)
+	if err != nil {
+		t.Fatalf("CountByTask: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("runs = %d, want 2", count)
+	}
+}
+
 func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)

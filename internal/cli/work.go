@@ -13,7 +13,6 @@ func (a *App) RunWork(ctx context.Context) error {
 	deps := runner.Deps{
 		DataDir:  a.DataDir,
 		Tasks:    a.Tasks,
-		Runs:     a.Runs,
 		Attempts: a.Attempts,
 		Output:   a.output(),
 		Options:  a.RunnerOptions,

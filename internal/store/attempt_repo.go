@@ -15,6 +15,15 @@ type AttemptRepo struct {
 	db *DB
 }
 
+// ResumeCandidate is the task state and terminal predecessor observed by one
+// database statement.
+type ResumeCandidate struct {
+	TaskStatus domain.TaskStatus
+	RunID      int64
+	SessionID  string
+	ExitReason domain.ExitReason
+}
+
 // FinishAttemptParams describes the attempt data stored alongside its single
 // terminal outcome. CommentAuthor and CommentBody must both be set or empty.
 type FinishAttemptParams struct {
@@ -30,6 +39,45 @@ type FinishAttemptParams struct {
 
 func NewAttemptRepo(db *DB) *AttemptRepo {
 	return &AttemptRepo{db: db}
+}
+
+// GetResumeCandidate snapshots task status and its latest terminal run so a
+// caller cannot accidentally adopt a concurrent invocation's running attempt.
+func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error) {
+	row := r.db.sql.QueryRow(
+		`SELECT tasks.status,
+		        COALESCE(candidate.id, 0),
+		        COALESCE(candidate.session_id, ''),
+		        COALESCE(candidate.exit_reason, '')
+		 FROM tasks
+		 LEFT JOIN runs AS candidate ON candidate.id = (
+		   SELECT id
+		   FROM runs
+		   WHERE task_id = tasks.id AND status <> ?
+		   ORDER BY id DESC
+		   LIMIT 1
+		 )
+		 WHERE tasks.id = ?`,
+		domain.RunRunning,
+		taskID,
+	)
+	var status string
+	var exitReason string
+	candidate := &ResumeCandidate{}
+	if err := row.Scan(
+		&status,
+		&candidate.RunID,
+		&candidate.SessionID,
+		&exitReason,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan resume candidate: %w", err)
+	}
+	candidate.TaskStatus = domain.TaskStatus(status)
+	candidate.ExitReason = domain.ExitReason(exitReason)
+	return candidate, nil
 }
 
 func (r *AttemptRepo) UpdateProgress(id int64, output string, tokensUsed int) error {

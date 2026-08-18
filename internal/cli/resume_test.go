@@ -28,7 +28,6 @@ func TestRunResumeReportsRecordedFailure(t *testing.T) {
 	deps := runner.Deps{
 		DataDir:  app.DataDir,
 		Tasks:    app.Tasks,
-		Runs:     app.Runs,
 		Attempts: app.Attempts,
 		Options:  runner.Options{NoDelay: true},
 	}

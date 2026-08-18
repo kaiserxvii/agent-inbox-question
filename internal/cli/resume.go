@@ -20,7 +20,6 @@ func (a *App) RunResume(ctx context.Context, args []string) error {
 	result, err := runner.Resume(ctx, runner.Deps{
 		DataDir:  a.DataDir,
 		Tasks:    a.Tasks,
-		Runs:     a.Runs,
 		Attempts: a.Attempts,
 		Output:   a.output(),
 		Options:  a.RunnerOptions,

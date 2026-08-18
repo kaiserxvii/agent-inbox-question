@@ -15,7 +15,6 @@ import (
 type Deps struct {
 	DataDir  string
 	Tasks    *store.TaskRepo
-	Runs     *store.RunRepo
 	Attempts *store.AttemptRepo
 	Output   io.Writer
 	Options  Options
@@ -66,57 +65,54 @@ func Execute(ctx context.Context, deps Deps, taskID int64) error {
 // Resume atomically claims a failed task and records a new attempt against its
 // persisted agent session.
 func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error) {
-	task, err := deps.Tasks.Get(taskID)
+	candidate, err := deps.Attempts.GetResumeCandidate(taskID)
 	if err != nil {
-		return AttemptResult{}, fmt.Errorf("get task %d: %w", taskID, err)
+		return AttemptResult{}, fmt.Errorf("get resume candidate for task %d: %w", taskID, err)
 	}
-	if task.Status != domain.TaskFailed {
-		if task.Status == domain.TaskInProgress {
+	if candidate.TaskStatus != domain.TaskFailed {
+		if candidate.TaskStatus == domain.TaskInProgress {
 			return AttemptResult{}, fmt.Errorf(
 				"%w: task %d cannot be resumed: status is %q",
 				&domain.TaskStatusConflict{
 					TaskID:   taskID,
 					Expected: domain.TaskFailed,
-					Observed: task.Status,
+					Observed: candidate.TaskStatus,
 				},
 				taskID,
-				task.Status,
+				candidate.TaskStatus,
 			)
 		}
-		return AttemptResult{}, fmt.Errorf("task %d cannot be resumed: status is %q", taskID, task.Status)
+		return AttemptResult{}, fmt.Errorf(
+			"task %d cannot be resumed: status is %q",
+			taskID,
+			candidate.TaskStatus,
+		)
 	}
-
-	previous, err := deps.Runs.LatestByTask(taskID)
-	if err != nil {
-		return AttemptResult{}, fmt.Errorf("latest run for task %d: %w", taskID, err)
+	if candidate.RunID == 0 {
+		return AttemptResult{}, fmt.Errorf("task %d has no terminal run to resume", taskID)
 	}
 
 	var opts []agent.Option
 	if deps.Options.NoDelay {
 		opts = append(opts, agent.WithNoDelay())
 	}
-	session, err := agent.Load(deps.DataDir, previous.SessionID, opts...)
+	session, err := agent.Load(deps.DataDir, candidate.SessionID, opts...)
 	if err != nil {
 		return AttemptResult{}, fmt.Errorf("load agent session: %w", err)
 	}
 
 	var allowance int
-	switch previous.ExitReason {
+	switch candidate.ExitReason {
 	case domain.ExitAgentError:
 		allowance = session.ConfiguredBudget()
 	case domain.ExitTokenBudgetExhausted:
-		allowance = session.ConfiguredBudget()
-	case domain.ExitNone:
-		// A concurrent resume can insert its running attempt after our task
-		// preflight but before LatestByTask. Prepare the shared session and let
-		// StartAttempt return the authoritative status conflict.
 		allowance = session.ConfiguredBudget()
 	default:
 		return AttemptResult{}, fmt.Errorf(
 			"task %d cannot resume run %d with exit reason %q",
 			taskID,
-			previous.ID,
-			previous.ExitReason,
+			candidate.RunID,
+			candidate.ExitReason,
 		)
 	}
 	if err := session.BeginAttempt(allowance); err != nil {
@@ -126,7 +122,7 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 	run, err := deps.Attempts.StartAttempt(
 		taskID,
 		domain.TaskFailed,
-		previous.ID,
+		candidate.RunID,
 		session.ID(),
 		session.AttemptAllowance(),
 	)
