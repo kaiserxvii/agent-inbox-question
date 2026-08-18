@@ -239,8 +239,9 @@ Every running run owns a cryptographically random token and a renewable three-
 second lease; executors renew once per second and fence immediately before every
 step. SQLite evaluates lease validity against its own current time and calculates
 renewal expiry from that same value; callers never provide an authorization time.
-The fenced SQLite checkpoint write is the simulated step's commit point. If it
-rejects a stale owner, the in-memory step is rolled back before it reaches the
+The fenced SQLite checkpoint write is the commit point for every simulated state
+transition, including terminal states that produce no output. If it rejects a
+stale owner, the in-memory transition is rolled back before it reaches the
 compatibility file or output stream. Task claims and run creation remain one
 SQLite compare-and-swap transaction, which also resolves races between `serve`
 and human commands.
@@ -263,6 +264,10 @@ creating a replacement run:
 - token exhaustion becomes scheduled or stopped according to completed-step delta;
 - agent errors become terminal errored runs;
 - interrupted or mid-step checkpoints become interrupted runs eligible immediately.
+
+Terminal checkpoints are published before the subsequent atomic run/task
+finalization, so a crash between those writes preserves the correct recovery
+policy.
 
 Therefore a stale executor can neither rewind its successor's recovery source nor
 publish another step after takeover. A crash after the database run is inserted

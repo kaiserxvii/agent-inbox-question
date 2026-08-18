@@ -42,6 +42,14 @@ type Event struct {
 	TokensUsed int
 }
 
+// StateCommit is the complete durable form of a session transition. Event is
+// present only when the transition also produced user-visible output.
+type StateCommit struct {
+	Checkpoint string
+	TokensUsed int
+	Event      *Event
+}
+
 type Step struct {
 	Name      string `json:"name"`
 	TokenCost int    `json:"token_cost"`
@@ -283,37 +291,39 @@ func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
 }
 
 func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error) {
-	var observe func(Event) error
+	var commit func(StateCommit) error
 	if onEvent != nil {
-		observe = func(event Event) error {
-			onEvent(event)
+		commit = func(change StateCommit) error {
+			if change.Event != nil {
+				onEvent(*change.Event)
+			}
 			return nil
 		}
 	}
-	return s.run(ctx, nil, observe)
+	return s.run(ctx, nil, commit)
 }
 
 // RunFenced verifies ownership before each step and commits the simulated side
-// effect through onEvent. A rejected commit rolls the in-memory step back and
-// never writes it to the compatibility session file.
+// effect and every terminal state through commit. A rejected commit rolls the
+// in-memory transition back and never writes it to the compatibility file.
 func (s *Session) RunFenced(
 	ctx context.Context,
 	fence func() error,
-	onEvent func(Event) error,
+	commit func(StateCommit) error,
 ) (Outcome, error) {
 	if fence == nil {
 		return Outcome{}, errors.New("step fence is required")
 	}
-	if onEvent == nil {
-		return Outcome{}, errors.New("fenced step sink is required")
+	if commit == nil {
+		return Outcome{}, errors.New("fenced state sink is required")
 	}
-	return s.run(ctx, fence, onEvent)
+	return s.run(ctx, fence, commit)
 }
 
 func (s *Session) run(
 	ctx context.Context,
 	fence func() error,
-	onEvent func(Event) error,
+	commit func(StateCommit) error,
 ) (Outcome, error) {
 	failAt := -1
 	if s.state.ErroredAt > 0 {
@@ -323,9 +333,10 @@ func (s *Session) run(
 	for s.state.NextStep < len(s.state.Steps) {
 		select {
 		case <-ctx.Done():
+			previous := cloneState(s.state)
 			s.state.AttemptHaltReason = HaltInterrupted
-			if err := s.persist(); err != nil {
-				return Outcome{}, fmt.Errorf("persist canceled session: %w", err)
+			if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "canceled session"); err != nil {
+				return Outcome{}, err
 			}
 			return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 		default:
@@ -340,20 +351,22 @@ func (s *Session) run(
 		stepIdx := s.state.NextStep + 1
 
 		if failAt > 0 && stepIdx == failAt {
+			previous := cloneState(s.state)
 			s.state.AttemptHaltReason = HaltAgentError
 			s.state.ErrorMessage = fmt.Sprintf("agent error at step %d: %s", stepIdx, step.Name)
 			s.state.ErroredAt = 0
-			if err := s.persist(); err != nil {
-				return Outcome{}, fmt.Errorf("persist agent error: %w", err)
+			if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "agent error"); err != nil {
+				return Outcome{}, err
 			}
 			return Outcome{Kind: Errored, Err: errors.New(s.state.ErrorMessage)}, nil
 		}
 
 		if step.TokenCost > s.state.TokensRemaining {
+			previous := cloneState(s.state)
 			s.state.BudgetHalted = true
 			s.state.AttemptHaltReason = HaltTokenExhausted
-			if err := s.persist(); err != nil {
-				return Outcome{}, fmt.Errorf("persist token exhaustion: %w", err)
+			if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "token exhaustion"); err != nil {
+				return Outcome{}, err
 			}
 			return Outcome{Kind: TokenBudgetExhausted}, nil
 		}
@@ -364,9 +377,10 @@ func (s *Session) run(
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				previous := cloneState(s.state)
 				s.state.AttemptHaltReason = HaltInterrupted
-				if err := s.persist(); err != nil {
-					return Outcome{}, fmt.Errorf("persist canceled session: %w", err)
+				if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "canceled session"); err != nil {
+					return Outcome{}, err
 				}
 				return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 			case <-timer.C:
@@ -391,23 +405,14 @@ func (s *Session) run(
 			Output:     step.Output,
 			TokensUsed: s.state.TokensUsed,
 		}
-		if fence != nil {
-			if err := onEvent(event); err != nil {
-				s.state = previous
-				return Outcome{}, err
-			}
-			if err := s.persist(); err != nil {
-				return Outcome{}, fmt.Errorf("persist fenced session: %w", err)
-			}
-		} else {
-			if err := s.persist(); err != nil {
-				return Outcome{}, fmt.Errorf("persist session: %w", err)
-			}
-			if onEvent != nil {
-				if err := onEvent(event); err != nil {
-					return Outcome{}, err
-				}
-			}
+		if err := s.commitState(
+			previous,
+			fence != nil,
+			commit,
+			StateCommit{Event: &event},
+			"session",
+		); err != nil {
+			return Outcome{}, err
 		}
 	}
 
@@ -421,26 +426,49 @@ func (s *Session) run(
 		Output:     summary,
 		TokensUsed: s.state.TokensUsed,
 	}
-	if fence != nil {
-		if err := onEvent(event); err != nil {
-			s.state = previous
-			return Outcome{}, err
-		}
-		if err := s.persist(); err != nil {
-			return Outcome{}, fmt.Errorf("persist fenced completion: %w", err)
-		}
-	} else {
-		if err := s.persist(); err != nil {
-			return Outcome{}, fmt.Errorf("persist completed session: %w", err)
-		}
-		if onEvent != nil {
-			if err := onEvent(event); err != nil {
-				return Outcome{}, err
-			}
-		}
+	if err := s.commitState(
+		previous,
+		fence != nil,
+		commit,
+		StateCommit{Event: &event},
+		"completed session",
+	); err != nil {
+		return Outcome{}, err
 	}
 
 	return Outcome{Kind: Completed}, nil
+}
+
+func (s *Session) commitState(
+	previous SessionState,
+	fenced bool,
+	commit func(StateCommit) error,
+	change StateCommit,
+	description string,
+) error {
+	if commit != nil {
+		checkpoint, err := s.Checkpoint()
+		if err != nil {
+			return fmt.Errorf("encode %s checkpoint: %w", description, err)
+		}
+		change.Checkpoint = checkpoint
+		change.TokensUsed = s.TokensUsed()
+	}
+	if fenced {
+		if err := commit(change); err != nil {
+			s.state = previous
+			return err
+		}
+	}
+	if err := s.persist(); err != nil {
+		return fmt.Errorf("persist %s: %w", description, err)
+	}
+	if !fenced && commit != nil {
+		if err := commit(change); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cloneState(state SessionState) SessionState {

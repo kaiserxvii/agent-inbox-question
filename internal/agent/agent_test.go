@@ -331,7 +331,7 @@ func TestRunFencedDoesNotExecuteAfterOwnershipIsLost(t *testing.T) {
 	_, err = session.RunFenced(
 		context.Background(),
 		func() error { return domain.ErrLeaseLost },
-		func(Event) error {
+		func(StateCommit) error {
 			executed++
 			return nil
 		},
@@ -348,6 +348,135 @@ func TestRunFencedDoesNotExecuteAfterOwnershipIsLost(t *testing.T) {
 	}
 	if loaded.CompletedSteps() != 0 {
 		t.Errorf("persisted completed steps = %d, want zero", loaded.CompletedSteps())
+	}
+}
+
+func TestRunFencedRollsBackRejectedTerminalState(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("create sessions directory: %v", err)
+	}
+	session, err := Start(
+		dir,
+		"terminal lease loss",
+		"[steps:1] [budget:1]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := session.BindAttempt(1, "owner"); err != nil {
+		t.Fatalf("BindAttempt: %v", err)
+	}
+
+	_, err = session.RunFenced(
+		context.Background(),
+		func() error { return nil },
+		func(change StateCommit) error {
+			if change.Event != nil {
+				t.Fatalf("terminal transition unexpectedly emitted event %#v", change.Event)
+			}
+			return domain.ErrLeaseLost
+		},
+	)
+	if !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("RunFenced error = %v, want ErrLeaseLost", err)
+	}
+	if got := session.AttemptCheckpoint().HaltReason; got != HaltRunning {
+		t.Errorf("in-memory halt reason = %q, want %q", got, HaltRunning)
+	}
+	loaded, err := Load(dir, session.ID(), WithNoDelay())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := loaded.AttemptCheckpoint().HaltReason; got != HaltRunning {
+		t.Errorf("persisted halt reason = %q, want %q", got, HaltRunning)
+	}
+}
+
+func TestRunFencedPublishesTerminalStatesWithoutEvents(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		cancel      bool
+		wantOutcome OutcomeKind
+		wantHalt    HaltReason
+	}{
+		{
+			name:        "token exhaustion",
+			description: "[steps:1] [budget:1]",
+			wantOutcome: TokenBudgetExhausted,
+			wantHalt:    HaltTokenExhausted,
+		},
+		{
+			name:        "agent error",
+			description: "[steps:1] [fail-at:1] [budget:5000]",
+			wantOutcome: Errored,
+			wantHalt:    HaltAgentError,
+		},
+		{
+			name:        "interruption",
+			description: "[steps:1] [budget:5000]",
+			cancel:      true,
+			wantOutcome: Interrupted,
+			wantHalt:    HaltInterrupted,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+				t.Fatalf("create sessions directory: %v", err)
+			}
+			session, err := Start(
+				dir,
+				test.name,
+				test.description,
+				nil,
+				WithNoDelay(),
+			)
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if err := session.BindAttempt(1, "owner"); err != nil {
+				t.Fatalf("BindAttempt: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if test.cancel {
+				cancel()
+			}
+			var commits []StateCommit
+			outcome, err := session.RunFenced(
+				ctx,
+				func() error { return nil },
+				func(change StateCommit) error {
+					commits = append(commits, change)
+					return nil
+				},
+			)
+			if err != nil {
+				t.Fatalf("RunFenced: %v", err)
+			}
+			if outcome.Kind != test.wantOutcome {
+				t.Errorf("outcome = %d, want %d", outcome.Kind, test.wantOutcome)
+			}
+			if len(commits) != 1 {
+				t.Fatalf("commits = %d, want one terminal commit", len(commits))
+			}
+			if commits[0].Event != nil {
+				t.Errorf("terminal commit event = %#v, want nil", commits[0].Event)
+			}
+			restored, err := Restore(dir, commits[0].Checkpoint, WithNoDelay())
+			if err != nil {
+				t.Fatalf("Restore committed checkpoint: %v", err)
+			}
+			if got := restored.AttemptCheckpoint().HaltReason; got != test.wantHalt {
+				t.Errorf("committed halt reason = %q, want %q", got, test.wantHalt)
+			}
+		})
 	}
 }
 

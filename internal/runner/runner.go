@@ -368,19 +368,17 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 			run.OwnerToken,
 			leaseDuration,
 		)
-	}, func(e agent.Event) error {
-		checkpoint, err := session.Checkpoint()
-		if err != nil {
-			cancel()
-			return err
+	}, func(change agent.StateCommit) error {
+		accumulatedLines := append([]string(nil), outputLines...)
+		if change.Event != nil {
+			accumulatedLines = append(accumulatedLines, change.Event.Output)
 		}
-		accumulatedLines := append(append([]string(nil), outputLines...), e.Output)
 		if err := deps.Attempts.UpdateProgress(store.AttemptProgress{
 			RunID:      run.ID,
 			OwnerToken: run.OwnerToken,
 			Output:     strings.Join(accumulatedLines, "\n"),
-			TokensUsed: e.TokensUsed,
-			Checkpoint: checkpoint,
+			TokensUsed: change.TokensUsed,
+			Checkpoint: change.Checkpoint,
 		}); err != nil {
 			if errors.Is(err, domain.ErrLeaseLost) {
 				cancel()
@@ -388,8 +386,8 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 			return fmt.Errorf("update run progress: %w", err)
 		}
 		outputLines = accumulatedLines
-		if deps.Output != nil && outputErr == nil {
-			if _, err := fmt.Fprintln(deps.Output, e.Output); err != nil {
+		if change.Event != nil && deps.Output != nil && outputErr == nil {
+			if _, err := fmt.Fprintln(deps.Output, change.Event.Output); err != nil {
 				outputErr = fmt.Errorf("write attempt output: %w", err)
 			}
 		}

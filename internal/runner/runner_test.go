@@ -927,21 +927,23 @@ func TestLeaseTakeoverHelper(t *testing.T) {
 		}
 		waitForFile(t, filepath.Join(dataDir, "takeover-go"), 5*time.Second, "takeover release")
 		return nil
-	}, func(event agent.Event) error {
-		checkpoint, err := session.Checkpoint()
-		if err != nil {
-			return err
+	}, func(change agent.StateCommit) error {
+		var output string
+		if change.Event != nil {
+			output = change.Event.Output
 		}
 		if err := attempts.UpdateProgress(store.AttemptProgress{
 			RunID:      run.ID,
 			OwnerToken: run.OwnerToken,
-			Output:     event.Output,
-			TokensUsed: event.TokensUsed,
-			Checkpoint: checkpoint,
+			Output:     output,
+			TokensUsed: change.TokensUsed,
+			Checkpoint: change.Checkpoint,
 		}); err != nil {
 			return err
 		}
-		executed++
+		if change.Event != nil {
+			executed++
+		}
 		return nil
 	})
 	result := fmt.Sprintf("unexpected:%d", executed)
