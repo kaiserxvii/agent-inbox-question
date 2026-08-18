@@ -358,11 +358,16 @@ func resume(ctx context.Context, deps Deps, request resumeRequest) (AttemptResul
 				taskID,
 			)
 		}
+		remaining := nextEligibleAt.Sub(now)
+		remainingText := remaining.Round(time.Second).String()
+		if remaining < time.Second {
+			remainingText = "less than 1s"
+		}
 		return AttemptResult{}, fmt.Errorf(
 			"task %d cannot be resumed until %s (%s remaining)",
 			taskID,
 			nextEligibleAt.Format(time.RFC3339),
-			nextEligibleAt.Sub(now).Round(time.Second),
+			remainingText,
 		)
 	}
 
