@@ -2,7 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -15,6 +17,8 @@ type App struct {
 	Tasks    *store.TaskRepo
 	Runs     *store.RunRepo
 	Comments *store.CommentRepo
+	out      io.Writer
+	noDelay  bool
 }
 
 func NewApp(dataDir string) (*App, error) {
@@ -28,11 +32,49 @@ func NewApp(dataDir string) (*App, error) {
 		Tasks:    store.NewTaskRepo(db),
 		Runs:     store.NewRunRepo(db),
 		Comments: store.NewCommentRepo(db),
+		out:      os.Stdout,
 	}, nil
 }
 
 func (a *App) Close() error {
 	return a.DB.Close()
+}
+
+func (a *App) output() io.Writer {
+	if a.out != nil {
+		return a.out
+	}
+	return os.Stdout
+}
+
+type outputPrinter struct {
+	writer io.Writer
+	err    error
+}
+
+func newOutputPrinter(writer io.Writer) *outputPrinter {
+	return &outputPrinter{writer: writer}
+}
+
+func (p *outputPrinter) Printf(format string, args ...any) {
+	if p.err != nil {
+		return
+	}
+	_, p.err = fmt.Fprintf(p.writer, format, args...)
+}
+
+func (p *outputPrinter) Println(args ...any) {
+	if p.err != nil {
+		return
+	}
+	_, p.err = fmt.Fprintln(p.writer, args...)
+}
+
+func (p *outputPrinter) Err() error {
+	if p.err != nil {
+		return fmt.Errorf("write output: %w", p.err)
+	}
+	return nil
 }
 
 func relativeTime(t time.Time) string {

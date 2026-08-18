@@ -82,6 +82,7 @@ var (
 var allowedTransitions = map[TaskStatus]map[TaskStatus]bool{
 	TaskTodo:       {TaskInProgress: true},
 	TaskInProgress: {TaskDone: true, TaskFailed: true},
+	TaskFailed:     {TaskInProgress: true},
 }
 
 func Transition(from, to TaskStatus) error {
@@ -89,4 +90,25 @@ func Transition(from, to TaskStatus) error {
 		return nil
 	}
 	return fmt.Errorf("%w: cannot transition from %q to %q", ErrInvalidTransition, from, to)
+}
+
+func ValidateTerminalOutcome(runStatus RunStatus, exitReason ExitReason, taskStatus TaskStatus) error {
+	valid := false
+	switch runStatus {
+	case RunSucceeded:
+		valid = exitReason == ExitCompleted && taskStatus == TaskDone
+	case RunErrored:
+		valid = exitReason == ExitAgentError && taskStatus == TaskFailed
+	case RunTokenExhausted:
+		valid = exitReason == ExitTokenBudgetExhausted && taskStatus == TaskFailed
+	}
+	if !valid {
+		return fmt.Errorf(
+			"inconsistent terminal outcome: run status %q, exit reason %q, task status %q",
+			runStatus,
+			exitReason,
+			taskStatus,
+		)
+	}
+	return nil
 }

@@ -12,11 +12,10 @@ import (
 
 func (a *App) RunWork(ctx context.Context) error {
 	deps := runner.Deps{
-		DataDir:  a.DataDir,
-		Tasks:    a.Tasks,
-		Runs:     a.Runs,
-		Comments: a.Comments,
-		Output:   os.Stdout,
+		DataDir: a.DataDir,
+		Tasks:   a.Tasks,
+		Runs:    a.Runs,
+		Output:  os.Stdout,
 	}
 
 	var total, succeeded, failed int

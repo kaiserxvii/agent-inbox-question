@@ -16,7 +16,11 @@ func openTestDB(t *testing.T) *DB {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close database: %v", err)
+		}
+	})
 	return db
 }
 
@@ -148,7 +152,13 @@ func TestRunCRUD(t *testing.T) {
 	tasks := NewTaskRepo(db)
 	runs := NewRunRepo(db)
 
-	task, _ := tasks.Create("t", "")
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	if err := tasks.Transition(task.ID, domain.TaskTodo, domain.TaskInProgress); err != nil {
+		t.Fatalf("transition task: %v", err)
+	}
 	run, err := runs.Create(task.ID, "abc123", 1200)
 	if err != nil {
 		t.Fatalf("Create run: %v", err)
@@ -164,8 +174,16 @@ func TestRunCRUD(t *testing.T) {
 		t.Fatalf("UpdateProgress: %v", err)
 	}
 
-	if err := runs.Finish(run.ID, domain.RunSucceeded, domain.ExitCompleted, "final output", 800, ""); err != nil {
-		t.Fatalf("Finish: %v", err)
+	if err := runs.FinishAttempt(FinishAttemptParams{
+		RunID:      run.ID,
+		TaskID:     task.ID,
+		RunStatus:  domain.RunSucceeded,
+		ExitReason: domain.ExitCompleted,
+		Output:     "final output",
+		TokensUsed: 800,
+		TaskStatus: domain.TaskDone,
+	}); err != nil {
+		t.Fatalf("FinishAttempt: %v", err)
 	}
 
 	list, err := runs.ListByTask(task.ID)
@@ -184,6 +202,105 @@ func TestRunCRUD(t *testing.T) {
 	}
 	if r.FinishedAt == nil {
 		t.Error("finished_at should be set")
+	}
+}
+
+func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	if err := tasks.Transition(task.ID, domain.TaskTodo, domain.TaskInProgress); err != nil {
+		t.Fatalf("transition task: %v", err)
+	}
+	run, err := runs.Create(task.ID, "session", 1000)
+	if err != nil {
+		t.Fatalf("Create run: %v", err)
+	}
+
+	err = runs.FinishAttempt(FinishAttemptParams{
+		RunID:         run.ID,
+		TaskID:        task.ID + 1,
+		RunStatus:     domain.RunSucceeded,
+		ExitReason:    domain.ExitCompleted,
+		Output:        "completed output",
+		TokensUsed:    500,
+		TaskStatus:    domain.TaskDone,
+		CommentAuthor: "agent",
+		CommentBody:   "complete",
+	})
+	if err == nil {
+		t.Fatal("FinishAttempt returned nil, want task transition error")
+	}
+
+	runList, err := runs.ListByTask(task.ID)
+	if err != nil {
+		t.Fatalf("ListByTask: %v", err)
+	}
+	if len(runList) != 1 {
+		t.Fatalf("runs = %d, want 1", len(runList))
+	}
+	if runList[0].Status != domain.RunRunning {
+		t.Errorf("run status = %q, want running after rollback", runList[0].Status)
+	}
+	if runList[0].FinishedAt != nil {
+		t.Error("run finished_at was set despite rollback")
+	}
+
+	got, err := tasks.Get(task.ID)
+	if err != nil {
+		t.Fatalf("Get task: %v", err)
+	}
+	if got.Status != domain.TaskInProgress {
+		t.Errorf("task status = %q, want in_progress after rollback", got.Status)
+	}
+}
+
+func TestFinishAttemptRejectsInconsistentOutcome(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	if err := tasks.Transition(task.ID, domain.TaskTodo, domain.TaskInProgress); err != nil {
+		t.Fatalf("transition task: %v", err)
+	}
+	run, err := runs.Create(task.ID, "session", 1000)
+	if err != nil {
+		t.Fatalf("Create run: %v", err)
+	}
+
+	err = runs.FinishAttempt(FinishAttemptParams{
+		RunID:      run.ID,
+		TaskID:     task.ID,
+		RunStatus:  domain.RunSucceeded,
+		ExitReason: domain.ExitCompleted,
+		TaskStatus: domain.TaskFailed,
+	})
+	if err == nil {
+		t.Fatal("FinishAttempt returned nil for inconsistent outcome")
+	}
+
+	runList, err := runs.ListByTask(task.ID)
+	if err != nil {
+		t.Fatalf("ListByTask: %v", err)
+	}
+	if runList[0].Status != domain.RunRunning {
+		t.Errorf("run status = %q, want running", runList[0].Status)
+	}
+	got, err := tasks.Get(task.ID)
+	if err != nil {
+		t.Fatalf("Get task: %v", err)
+	}
+	if got.Status != domain.TaskInProgress {
+		t.Errorf("task status = %q, want in_progress", got.Status)
 	}
 }
 

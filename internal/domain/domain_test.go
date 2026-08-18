@@ -12,6 +12,7 @@ func TestTransition(t *testing.T) {
 		{TaskTodo, TaskInProgress},
 		{TaskInProgress, TaskDone},
 		{TaskInProgress, TaskFailed},
+		{TaskFailed, TaskInProgress},
 	}
 	for _, tc := range allowed {
 		if err := Transition(tc.from, tc.to); err != nil {
@@ -32,7 +33,6 @@ func TestTransition(t *testing.T) {
 		{TaskDone, TaskInProgress},
 		{TaskDone, TaskFailed},
 		{TaskFailed, TaskTodo},
-		{TaskFailed, TaskInProgress},
 		{TaskFailed, TaskDone},
 		{TaskFailed, TaskFailed},
 	}

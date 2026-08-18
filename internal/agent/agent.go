@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -22,7 +23,8 @@ const DefaultTokenBudget = 3500
 type OutcomeKind int
 
 const (
-	Completed OutcomeKind = iota
+	OutcomeUnknown OutcomeKind = iota
+	Completed
 	Errored
 	TokenBudgetExhausted
 )
@@ -107,12 +109,9 @@ func Start(dataDir, taskTitle, taskDescription string, feedback []string, opts .
 		NextStep:    0,
 	}
 
-	failAt := -1
-	if v, ok := directives["fail-at"]; ok {
-		failAt = v
+	if failAt, ok := directives["fail-at"]; ok {
 		state.ErroredAt = failAt
 	}
-	_ = failAt
 
 	s := &Session{state: state, dataDir: dataDir}
 	for _, o := range opts {
@@ -159,7 +158,9 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 	for s.state.NextStep < len(s.state.Steps) {
 		select {
 		case <-ctx.Done():
-			s.persist()
+			if err := s.persist(); err != nil {
+				return Outcome{}, fmt.Errorf("persist canceled session: %w", err)
+			}
 			return Outcome{Kind: Errored, Err: ctx.Err()}, nil
 		default:
 		}
@@ -169,13 +170,18 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 
 		if failAt > 0 && stepIdx == failAt {
 			s.state.ErrorMessage = fmt.Sprintf("agent error at step %d: %s", stepIdx, step.Name)
-			s.persist()
-			return Outcome{Kind: Errored, Err: fmt.Errorf("%s", s.state.ErrorMessage)}, nil
+			s.state.ErroredAt = 0
+			if err := s.persist(); err != nil {
+				return Outcome{}, fmt.Errorf("persist agent error: %w", err)
+			}
+			return Outcome{Kind: Errored, Err: errors.New(s.state.ErrorMessage)}, nil
 		}
 
 		if s.state.TokensUsed+step.TokenCost > s.state.TokenBudget {
 			s.state.BudgetHalted = true
-			s.persist()
+			if err := s.persist(); err != nil {
+				return Outcome{}, fmt.Errorf("persist token exhaustion: %w", err)
+			}
 			return Outcome{Kind: TokenBudgetExhausted}, nil
 		}
 
@@ -185,7 +191,9 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				s.persist()
+				if err := s.persist(); err != nil {
+					return Outcome{}, fmt.Errorf("persist canceled session: %w", err)
+				}
 				return Outcome{Kind: Errored, Err: ctx.Err()}, nil
 			case <-timer.C:
 			}
@@ -196,6 +204,10 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 		s.state.TokensUsed += step.TokenCost
 		s.state.NextStep++
 
+		if err := s.persist(); err != nil {
+			return Outcome{}, fmt.Errorf("persist session: %w", err)
+		}
+
 		if onEvent != nil {
 			onEvent(Event{
 				Step:       stepIdx,
@@ -204,14 +216,12 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 				TokensUsed: s.state.TokensUsed,
 			})
 		}
-
-		if err := s.persist(); err != nil {
-			return Outcome{}, fmt.Errorf("persist session: %w", err)
-		}
 	}
 
 	s.state.Completed = true
-	s.persist()
+	if err := s.persist(); err != nil {
+		return Outcome{}, fmt.Errorf("persist completed session: %w", err)
+	}
 
 	summary := fmt.Sprintf("completed all %d steps for: %s", len(s.state.Steps), s.state.TaskTitle)
 	if onEvent != nil {

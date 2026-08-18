@@ -44,6 +44,7 @@ Commands:
   list [--status <status>]         List tasks
   show <id>                        Show task details, runs, and output
   run <id>                         Execute a todo task
+  resume <id>                      Resume a failed task
   work                             Execute all todo tasks in order
   status                           Show task counts by status
 
@@ -94,6 +95,15 @@ in_progress  0
 done         1
 failed       2
 total        3
+
+# Resume the task that hit an agent error. Completed work is not repeated.
+$ agent-inbox resume 2
+[step 2/5] research: processed
+...
+Task #2: done (completed)
+
+# See both attempts and the output produced by each one.
+$ agent-inbox show 2
 ```
 
 ## Directives
@@ -104,7 +114,7 @@ agent's behavior:
 | Directive     | Effect                                              |
 |---------------|-----------------------------------------------------|
 | `[steps:N]`   | Force the agent plan to have exactly N steps         |
-| `[fail-at:N]` | The agent errors at step N                           |
+| `[fail-at:N]` | The agent errors once at step N; resume retries it   |
 | `[budget:N]`  | Override the agent's token budget (default: 3500)    |
 
 Directives are composable: `[steps:20] [budget:500]` creates a 20-step task
@@ -116,7 +126,7 @@ that will exhaust its budget partway through.
 ~/.agent-inbox/
   inbox.db           SQLite database (tasks, runs, comments)
   sessions/
-    <session-id>.json   Persisted agent session state per run
+    <session-id>.json   Persisted agent session state shared across attempts
 ```
 
 Override with `--data-dir` or `AGENT_INBOX_DATA_DIR`.
@@ -139,11 +149,36 @@ internal/cli/              One file per command, table rendering
 The only external dependency is `modernc.org/sqlite` (pure-Go SQLite). No cobra,
 no uuid lib, no test framework — standard library only beyond the database driver.
 
+### Resume model
+
+A task and an agent session span one or more runs. A run is a single attempt:
+`resume` atomically claims a `failed` task, loads the latest run's session, and
+creates a new run before driving the remaining steps. Earlier runs are append-only,
+and `show` groups each run with the output produced by that attempt.
+
+The `failed` to `in_progress` transition is a compare-and-swap update in SQLite.
+If two callers try to resume the same task, exactly one claims it; the other reports
+the status it observes. The same runner interface is used by CLI callers and can be
+reused by an automated caller without duplicating claim or bookkeeping logic.
+
+At the end of an attempt, the run outcome, task transition, and optional success
+comment are committed in one transaction. Invalid combinations such as a succeeded
+run paired with a failed task are rejected before any state is changed.
+
+Manual resume starts a fresh token allowance while preserving unused allowance from
+the prior attempt. A simulated `[fail-at:N]` error is transient: it is consumed when
+first raised, so resume retries the unfinished step. A resumed attempt may still end
+in `failed` (for example, by exhausting its new allowance); that outcome is recorded
+and printed explicitly. As with `run`, a completed attempt that records task failure
+does not make the command itself fail. Rejected or conflicting invocations do return
+a non-zero exit status.
+
 ## Known limitations
 
-- Tasks end in `done` or `failed`, and both are final. A failed task must be
-  recreated from scratch; when a session exhausts its token budget, completed-step
-  output is kept but the work cannot be picked back up.
+- Token allowance refresh is immediate and manually triggered by `resume`; there is
+  no reset schedule or automatic continuation process yet.
+- An interrupted process can leave a task `in_progress`; crash recovery is not part
+  of the manual resume implementation.
 - Only one task can be in progress at a time; there is no concurrent execution.
 - The simulated agent is deterministic — the same task title and description
   always produce the same plan and step costs.

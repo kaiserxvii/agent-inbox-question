@@ -19,6 +19,7 @@ Commands:
   list [--status <status>]         List tasks
   show <id>                        Show task details, runs, and output
   run <id>                         Execute a todo task
+  resume <id>                      Resume a failed task
   work                             Execute all todo tasks in order
   status                           Show task counts by status
 
@@ -72,6 +73,8 @@ func run() int {
 		err = app.RunShow(cmdArgs)
 	case "run":
 		err = app.RunRun(ctx, cmdArgs)
+	case "resume":
+		err = app.RunResume(ctx, cmdArgs)
 	case "work":
 		err = app.RunWork(ctx)
 	case "status":

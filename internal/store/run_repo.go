@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +11,21 @@ import (
 
 type RunRepo struct {
 	db *DB
+}
+
+// FinishAttemptParams describes the durable terminal state for one attempt and
+// its task. CommentAuthor and CommentBody must either both be set or both empty.
+type FinishAttemptParams struct {
+	RunID         int64
+	TaskID        int64
+	RunStatus     domain.RunStatus
+	ExitReason    domain.ExitReason
+	Output        string
+	TokensUsed    int
+	Error         string
+	TaskStatus    domain.TaskStatus
+	CommentAuthor string
+	CommentBody   string
 }
 
 func NewRunRepo(db *DB) *RunRepo {
@@ -52,21 +68,99 @@ func (r *RunRepo) UpdateProgress(id int64, output string, tokensUsed int) error 
 	return nil
 }
 
-func (r *RunRepo) Finish(id int64, status domain.RunStatus, exitReason domain.ExitReason, output string, tokensUsed int, errText string) error {
+// FinishAttempt atomically finalizes a run, transitions its task, and records
+// an optional comment.
+func (r *RunRepo) FinishAttempt(params FinishAttemptParams) error {
+	if err := domain.ValidateTerminalOutcome(params.RunStatus, params.ExitReason, params.TaskStatus); err != nil {
+		return fmt.Errorf("validate attempt outcome: %w", err)
+	}
+	if err := domain.Transition(domain.TaskInProgress, params.TaskStatus); err != nil {
+		return fmt.Errorf("validate final task status: %w", err)
+	}
+	commentIncomplete := (params.CommentAuthor == "") != (params.CommentBody == "")
+	if commentIncomplete {
+		return errors.New("attempt comment requires both author and body")
+	}
+
+	tx, err := r.db.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin finish attempt transaction: %w", err)
+	}
+	rollback := func(cause error) error {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			return errors.Join(cause, fmt.Errorf("rollback finish attempt transaction: %w", rollbackErr))
+		}
+		return cause
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := r.db.sql.Exec(
-		"UPDATE runs SET status = ?, exit_reason = ?, output = ?, tokens_used = ?, error = ?, finished_at = ? WHERE id = ?",
-		status, exitReason, output, tokensUsed, errText, now, id,
+	runResult, err := tx.Exec(
+		`UPDATE runs
+		 SET status = ?, exit_reason = ?, output = ?, tokens_used = ?, error = ?, finished_at = ?
+		 WHERE id = ? AND task_id = ? AND status = ?`,
+		params.RunStatus,
+		params.ExitReason,
+		params.Output,
+		params.TokensUsed,
+		params.Error,
+		now,
+		params.RunID,
+		params.TaskID,
+		domain.RunRunning,
 	)
 	if err != nil {
-		return fmt.Errorf("finish run: %w", err)
+		return rollback(fmt.Errorf("finish run: %w", err))
+	}
+	rows, err := runResult.RowsAffected()
+	if err != nil {
+		return rollback(fmt.Errorf("count finished runs: %w", err))
+	}
+	if rows != 1 {
+		return rollback(fmt.Errorf("%w: run %d is no longer running", domain.ErrConflict, params.RunID))
+	}
+
+	taskResult, err := tx.Exec(
+		`UPDATE tasks SET status = ?, updated_at = ?
+		 WHERE id = ? AND status = ?`,
+		params.TaskStatus,
+		now,
+		params.TaskID,
+		domain.TaskInProgress,
+	)
+	if err != nil {
+		return rollback(fmt.Errorf("finish task: %w", err))
+	}
+	rows, err = taskResult.RowsAffected()
+	if err != nil {
+		return rollback(fmt.Errorf("count finished tasks: %w", err))
+	}
+	if rows != 1 {
+		return rollback(fmt.Errorf("%w: task %d is no longer in progress", domain.ErrConflict, params.TaskID))
+	}
+
+	if params.CommentAuthor != "" {
+		_, err = tx.Exec(
+			`INSERT INTO comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)`,
+			params.TaskID,
+			params.CommentAuthor,
+			params.CommentBody,
+			now,
+		)
+		if err != nil {
+			return rollback(fmt.Errorf("create attempt comment: %w", err))
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return rollback(fmt.Errorf("commit finish attempt transaction: %w", err))
 	}
 	return nil
 }
 
 func (r *RunRepo) ListByTask(taskID int64) ([]*domain.Run, error) {
 	rows, err := r.db.sql.Query(
-		`SELECT id, task_id, session_id, status, exit_reason, output, tokens_used, token_budget, error, started_at, finished_at
+		`SELECT id, task_id, session_id, status, exit_reason, output,
+		        tokens_used, token_budget, error, started_at, finished_at
 		 FROM runs WHERE task_id = ? ORDER BY id`, taskID,
 	)
 	if err != nil {

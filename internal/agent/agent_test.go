@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -118,6 +119,77 @@ func TestFailAt(t *testing.T) {
 	}
 	if len(events) != 1 {
 		t.Errorf("events = %d, want 1 (one step before fail)", len(events))
+	}
+}
+
+func TestRunReportsFailureWhenAgentErrorStateCannotBePersisted(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	s, err := Start(
+		dir,
+		"t",
+		"[steps:3] [fail-at:1] [budget:5000]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	sessionPath := filepath.Join(dir, "sessions", s.ID()+".json")
+	if err := os.Remove(sessionPath); err != nil {
+		t.Fatalf("Remove session file: %v", err)
+	}
+	if err := os.Mkdir(sessionPath, 0o755); err != nil {
+		t.Fatalf("replace session file with directory: %v", err)
+	}
+
+	_, err = s.Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("Run returned nil, want persistence error")
+	}
+	if !strings.Contains(err.Error(), "persist agent error") {
+		t.Errorf("Run error = %q, want agent error persistence context", err)
+	}
+}
+
+func TestRunDoesNotPublishStepBeforeItIsPersisted(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	s, err := Start(
+		dir,
+		"t",
+		"[steps:1] [budget:5000]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	sessionPath := filepath.Join(dir, "sessions", s.ID()+".json")
+	if err := os.Remove(sessionPath); err != nil {
+		t.Fatalf("Remove session file: %v", err)
+	}
+	if err := os.Mkdir(sessionPath, 0o755); err != nil {
+		t.Fatalf("replace session file with directory: %v", err)
+	}
+
+	var events []Event
+	_, err = s.Run(context.Background(), func(event Event) {
+		events = append(events, event)
+	})
+	if err == nil {
+		t.Fatal("Run returned nil, want persistence error")
+	}
+	if len(events) != 0 {
+		t.Errorf("published %d events for undurable work, want 0", len(events))
 	}
 }
 

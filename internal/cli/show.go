@@ -20,52 +20,66 @@ func (a *App) RunShow(args []string) error {
 		return fmt.Errorf("get task: %w", err)
 	}
 
-	fmt.Printf("Task #%d\n", task.ID)
-	fmt.Printf("  Title:       %s\n", task.Title)
-	fmt.Printf("  Description: %s\n", task.Description)
-	fmt.Printf("  Status:      %s\n", task.Status)
-	fmt.Printf("  Created:     %s\n", relativeTime(task.CreatedAt))
-	fmt.Printf("  Updated:     %s\n", relativeTime(task.UpdatedAt))
+	out := newOutputPrinter(a.output())
+	out.Printf("Task #%d\n", task.ID)
+	out.Printf("  Title:       %s\n", task.Title)
+	out.Printf("  Description: %s\n", task.Description)
+	out.Printf("  Status:      %s\n", task.Status)
+	out.Printf("  Created:     %s\n", relativeTime(task.CreatedAt))
+	out.Printf("  Updated:     %s\n", relativeTime(task.UpdatedAt))
+	if err := out.Err(); err != nil {
+		return err
+	}
 
-	comments, _ := a.Comments.ListByTask(id)
+	comments, err := a.Comments.ListByTask(id)
+	if err != nil {
+		return fmt.Errorf("list comments: %w", err)
+	}
 	if len(comments) > 0 {
-		fmt.Println()
-		fmt.Println("Comments:")
+		out.Println()
+		out.Println("Comments:")
 		for _, c := range comments {
-			fmt.Printf("  [%s] %s (%s)\n", c.Author, c.Body, relativeTime(c.CreatedAt))
+			out.Printf("  [%s] %s (%s)\n", c.Author, c.Body, relativeTime(c.CreatedAt))
+		}
+		if err := out.Err(); err != nil {
+			return err
 		}
 	}
 
-	runs, _ := a.Runs.ListByTask(id)
+	runs, err := a.Runs.ListByTask(id)
+	if err != nil {
+		return fmt.Errorf("list runs: %w", err)
+	}
 	if len(runs) > 0 {
-		fmt.Println()
-		fmt.Println("Runs:")
-		for _, r := range runs {
+		out.Println()
+		out.Println("Runs:")
+		for i, r := range runs {
+			if i > 0 {
+				out.Println()
+			}
 			finished := "running"
 			if r.FinishedAt != nil {
 				finished = relativeTime(*r.FinishedAt)
 			}
-			fmt.Printf("  Run #%d\n", r.ID)
-			fmt.Printf("    Session:     %s\n", r.SessionID)
-			fmt.Printf("    Status:      %s\n", r.Status)
-			fmt.Printf("    Exit reason: %s\n", displayExitReason(string(r.ExitReason)))
-			fmt.Printf("    Tokens:      %d / %d\n", r.TokensUsed, r.TokenBudget)
-			fmt.Printf("    Started:     %s\n", relativeTime(r.StartedAt))
-			fmt.Printf("    Finished:    %s\n", finished)
+			out.Printf("  Run #%d\n", r.ID)
+			out.Printf("    Session:     %s\n", r.SessionID)
+			out.Printf("    Status:      %s\n", r.Status)
+			out.Printf("    Exit reason: %s\n", displayExitReason(string(r.ExitReason)))
+			out.Printf("    Tokens:      %d / %d\n", r.TokensUsed, r.TokenBudget)
+			out.Printf("    Started:     %s\n", relativeTime(r.StartedAt))
+			out.Printf("    Finished:    %s\n", finished)
 			if r.Error != "" {
-				fmt.Printf("    Error:       %s\n", r.Error)
+				out.Printf("    Error:       %s\n", r.Error)
 			}
-		}
-
-		latest := runs[len(runs)-1]
-		if latest.Output != "" {
-			fmt.Println()
-			fmt.Println(strings.Repeat("─", 40) + " output " + strings.Repeat("─", 40))
-			fmt.Println(latest.Output)
+			if r.Output != "" {
+				out.Println()
+				out.Println(strings.Repeat("─", 32) + fmt.Sprintf(" run #%d output ", r.ID) + strings.Repeat("─", 32))
+				out.Println(r.Output)
+			}
 		}
 	}
 
-	return nil
+	return out.Err()
 }
 
 func displayExitReason(s string) string {
