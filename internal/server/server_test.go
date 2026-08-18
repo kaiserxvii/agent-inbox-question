@@ -307,15 +307,16 @@ func TestServerDoesNotRetryFreshWindowThatCompletesNoSteps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if stopped.AutoRetryState != store.AutoRetryStopped {
-		t.Errorf("auto retry state = %q, want stopped", stopped.AutoRetryState)
+	if stopped.Continuation.Kind() != domain.ContinuationStopped {
+		t.Errorf("auto retry state = %q, want stopped", stopped.Continuation.Kind())
 	}
 	const wantReason = "auto-retry stopped: next step requires more than the configured window"
-	if stopped.AutoRetryReason != wantReason {
-		t.Errorf("auto retry reason = %q, want %q", stopped.AutoRetryReason, wantReason)
+	if stopped.Continuation.Reason() != wantReason {
+		t.Errorf("auto retry reason = %q, want %q", stopped.Continuation.Reason(), wantReason)
 	}
-	if stopped.NextEligibleAt != nil {
-		t.Errorf("next eligible at = %s, want none", stopped.NextEligibleAt)
+	wantReset := now.Add(time.Hour)
+	if stopped.Continuation.EligibleAt() == nil || !stopped.Continuation.EligibleAt().Equal(wantReset) {
+		t.Errorf("next eligible at = %v, want provider reset %s", stopped.Continuation.EligibleAt(), wantReset)
 	}
 
 	clock := newFakeClock(now.Add(24 * time.Hour))
@@ -393,11 +394,11 @@ func TestServerDoesNotRetryAgentErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if failed.AutoRetryState != "" || failed.NextEligibleAt != nil {
+	if failed.Continuation.Kind() != "" || failed.Continuation.EligibleAt() != nil {
 		t.Fatalf(
 			"agent error scheduling = (%q, %v), want no automatic retry",
-			failed.AutoRetryState,
-			failed.NextEligibleAt,
+			failed.Continuation.Kind(),
+			failed.Continuation.EligibleAt(),
 		)
 	}
 
@@ -632,8 +633,8 @@ func TestServerSchedulesPreviouslyUnscheduledTokenExhaustion(t *testing.T) {
 		t.Fatalf("Get scheduled task: %v", err)
 	}
 	wantEligible := initialRun.FinishedAt.Add(resetInterval)
-	if scheduled.NextEligibleAt == nil || !scheduled.NextEligibleAt.Equal(wantEligible) {
-		t.Errorf("next eligibility = %v, want %s", scheduled.NextEligibleAt, wantEligible)
+	if scheduled.Continuation.EligibleAt() == nil || !scheduled.Continuation.EligibleAt().Equal(wantEligible) {
+		t.Errorf("next eligibility = %v, want %s", scheduled.Continuation.EligibleAt(), wantEligible)
 	}
 
 	cancel()

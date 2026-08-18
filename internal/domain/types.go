@@ -53,6 +53,154 @@ const (
 	AttemptInterrupted    AttemptOutcome = "interrupted"
 )
 
+type ContinuationKind string
+
+const (
+	ContinuationNone      ContinuationKind = ""
+	ContinuationScheduled ContinuationKind = "scheduled"
+	ContinuationStopped   ContinuationKind = "stopped"
+
+	AutoRetryNoProgressReason = "auto-retry stopped: next step requires more than the configured window"
+)
+
+// ContinuationDecision keeps provider reset eligibility independent from the
+// automatic retry decision while preventing invalid persisted combinations.
+type ContinuationDecision struct {
+	kind       ContinuationKind
+	eligibleAt *time.Time
+	reason     string
+}
+
+func NoContinuation() ContinuationDecision {
+	return ContinuationDecision{}
+}
+
+func ScheduledContinuation(eligibleAt time.Time) ContinuationDecision {
+	eligibleAt = eligibleAt.UTC()
+	return ContinuationDecision{kind: ContinuationScheduled, eligibleAt: &eligibleAt}
+}
+
+func StoppedContinuation(eligibleAt time.Time, reason string) (ContinuationDecision, error) {
+	if reason == "" {
+		return ContinuationDecision{}, errors.New("stopped continuation requires a reason")
+	}
+	eligibleAt = eligibleAt.UTC()
+	return ContinuationDecision{
+		kind:       ContinuationStopped,
+		eligibleAt: &eligibleAt,
+		reason:     reason,
+	}, nil
+}
+
+func ParseContinuation(
+	kind string,
+	eligibleAt *time.Time,
+	reason string,
+) (ContinuationDecision, error) {
+	switch ContinuationKind(kind) {
+	case ContinuationNone:
+		if eligibleAt != nil || reason != "" {
+			return ContinuationDecision{}, errors.New("empty continuation has scheduling data")
+		}
+		return NoContinuation(), nil
+	case ContinuationScheduled:
+		if eligibleAt == nil || reason != "" {
+			return ContinuationDecision{}, errors.New("scheduled continuation requires only eligibility")
+		}
+		return ScheduledContinuation(*eligibleAt), nil
+	case ContinuationStopped:
+		if eligibleAt == nil {
+			return ContinuationDecision{}, errors.New("stopped continuation requires provider reset eligibility")
+		}
+		return StoppedContinuation(*eligibleAt, reason)
+	default:
+		return ContinuationDecision{}, fmt.Errorf("unknown continuation state: %q", kind)
+	}
+}
+
+func (d ContinuationDecision) Kind() ContinuationKind { return d.kind }
+func (d ContinuationDecision) Reason() string         { return d.reason }
+
+func (d ContinuationDecision) EligibleAt() *time.Time {
+	if d.eligibleAt == nil {
+		return nil
+	}
+	eligibleAt := *d.eligibleAt
+	return &eligibleAt
+}
+
+type AttemptCompletion struct {
+	outcome      AttemptOutcome
+	continuation ContinuationDecision
+}
+
+func NewAttemptCompletion(
+	outcome AttemptOutcome,
+	continuation ContinuationDecision,
+) (AttemptCompletion, error) {
+	if _, err := outcome.TerminalState(); err != nil {
+		return AttemptCompletion{}, err
+	}
+	kind := continuation.Kind()
+	valid := false
+	switch outcome {
+	case AttemptCompleted, AttemptAgentError:
+		valid = kind == ContinuationNone
+	case AttemptTokenExhausted:
+		valid = kind == ContinuationNone ||
+			kind == ContinuationScheduled ||
+			kind == ContinuationStopped
+	case AttemptInterrupted:
+		valid = kind == ContinuationScheduled
+	}
+	if !valid {
+		return AttemptCompletion{}, fmt.Errorf(
+			"attempt outcome %q cannot use continuation %q",
+			outcome,
+			kind,
+		)
+	}
+	return AttemptCompletion{outcome: outcome, continuation: continuation}, nil
+}
+
+func DecideAttemptCompletion(
+	outcome AttemptOutcome,
+	finishedAt time.Time,
+	resetInterval time.Duration,
+	progressed bool,
+) (AttemptCompletion, error) {
+	decision := NoContinuation()
+	switch outcome {
+	case AttemptTokenExhausted:
+		if resetInterval > 0 {
+			resetAt := finishedAt.UTC().Add(resetInterval)
+			if progressed {
+				decision = ScheduledContinuation(resetAt)
+			} else {
+				var err error
+				decision, err = StoppedContinuation(resetAt, AutoRetryNoProgressReason)
+				if err != nil {
+					return AttemptCompletion{}, err
+				}
+			}
+		}
+	case AttemptInterrupted:
+		decision = ScheduledContinuation(finishedAt)
+	case AttemptCompleted, AttemptAgentError:
+	default:
+		return AttemptCompletion{}, fmt.Errorf("unknown attempt outcome: %q", outcome)
+	}
+	return NewAttemptCompletion(outcome, decision)
+}
+
+func (c AttemptCompletion) Outcome() AttemptOutcome {
+	return c.outcome
+}
+
+func (c AttemptCompletion) Continuation() ContinuationDecision {
+	return c.continuation
+}
+
 type TerminalAttemptState struct {
 	RunStatus  RunStatus
 	ExitReason ExitReason
@@ -91,32 +239,31 @@ func (o AttemptOutcome) TerminalState() (TerminalAttemptState, error) {
 }
 
 type Task struct {
-	ID              int64
-	Title           string
-	Description     string
-	Status          TaskStatus
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	NextEligibleAt  *time.Time
-	AutoRetryState  string
-	AutoRetryReason string
+	ID           int64
+	Title        string
+	Description  string
+	Status       TaskStatus
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	Continuation ContinuationDecision
 }
 
 type Run struct {
-	ID             int64
-	TaskID         int64
-	SessionID      string
-	Status         RunStatus
-	ExitReason     ExitReason
-	Output         string
-	TokensUsed     int
-	TokenBudget    int
-	Error          string
-	StartedAt      time.Time
-	FinishedAt     *time.Time
-	OwnerToken     string
-	LeaseExpiresAt *time.Time
-	StartStep      int
+	ID                int64
+	TaskID            int64
+	SessionID         string
+	Status            RunStatus
+	ExitReason        ExitReason
+	Output            string
+	TokensUsed        int
+	TokenBudget       int
+	Error             string
+	StartedAt         time.Time
+	FinishedAt        *time.Time
+	OwnerToken        string
+	LeaseExpiresAt    *time.Time
+	StartStep         int
+	SessionCheckpoint string
 }
 
 type Comment struct {
@@ -131,6 +278,7 @@ var (
 	ErrInvalidTransition = errors.New("invalid status transition")
 	ErrConflict          = errors.New("concurrent modification conflict")
 	ErrNotFound          = errors.New("not found")
+	ErrNotEligible       = errors.New("attempt is not eligible")
 	ErrLeaseLost         = errors.New("attempt lease lost")
 )
 

@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestTransition(t *testing.T) {
@@ -94,5 +95,49 @@ func TestAttemptOutcomeDeterminesEveryTerminalStatus(t *testing.T) {
 				test.taskStatus,
 			)
 		}
+	}
+}
+
+func TestTokenExhaustionStopsRetryWithoutDiscardingProviderReset(t *testing.T) {
+	finishedAt := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	completion, err := DecideAttemptCompletion(
+		AttemptTokenExhausted,
+		finishedAt,
+		time.Hour,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("DecideAttemptCompletion: %v", err)
+	}
+	if completion.Outcome() != AttemptTokenExhausted {
+		t.Errorf("outcome = %q, want token exhausted", completion.Outcome())
+	}
+	decision := completion.Continuation()
+	if decision.Kind() != ContinuationStopped {
+		t.Errorf("continuation = %q, want stopped", decision.Kind())
+	}
+	wantReset := finishedAt.Add(time.Hour)
+	if reset := decision.EligibleAt(); reset == nil || !reset.Equal(wantReset) {
+		t.Errorf("provider reset = %v, want %s", reset, wantReset)
+	}
+	if decision.Reason() != AutoRetryNoProgressReason {
+		t.Errorf("reason = %q, want %q", decision.Reason(), AutoRetryNoProgressReason)
+	}
+}
+
+func TestAttemptCompletionRejectsUnknownOutcome(t *testing.T) {
+	if _, err := NewAttemptCompletion(AttemptOutcome("unknown"), NoContinuation()); err == nil {
+		t.Fatal("NewAttemptCompletion accepted unknown outcome")
+	}
+}
+
+func TestAttemptCompletionRejectsIncompatibleContinuation(t *testing.T) {
+	resetAt := time.Date(2026, time.August, 17, 13, 0, 0, 0, time.UTC)
+	stopped, err := StoppedContinuation(resetAt, AutoRetryNoProgressReason)
+	if err != nil {
+		t.Fatalf("StoppedContinuation: %v", err)
+	}
+	if _, err := NewAttemptCompletion(AttemptCompleted, stopped); err == nil {
+		t.Fatal("NewAttemptCompletion accepted stopped retry for completed attempt")
 	}
 }

@@ -2,10 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 func TestDeterministicPlan(t *testing.T) {
@@ -306,6 +309,42 @@ func TestBeginAttemptUsesExplicitAllowanceWithoutChangingConfiguredBudget(t *tes
 	}
 	if session.TokensUsed() != 0 {
 		t.Errorf("attempt usage = %d, want 0", session.TokensUsed())
+	}
+}
+
+func TestRunFencedDoesNotExecuteAfterOwnershipIsLost(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("create sessions directory: %v", err)
+	}
+	session, err := Start(
+		dir,
+		"stale executor",
+		"[steps:1] [budget:5000]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	executed := 0
+	_, err = session.RunFenced(
+		context.Background(),
+		func() error { return domain.ErrLeaseLost },
+		func(Event) { executed++ },
+	)
+	if !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("RunFenced error = %v, want ErrLeaseLost", err)
+	}
+	if executed != 0 || session.CompletedSteps() != 0 {
+		t.Errorf("executed events = %d, completed steps = %d; want zero", executed, session.CompletedSteps())
+	}
+	loaded, err := Load(dir, session.ID(), WithNoDelay())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.CompletedSteps() != 0 {
+		t.Errorf("persisted completed steps = %d, want zero", loaded.CompletedSteps())
 	}
 }
 

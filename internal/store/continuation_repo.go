@@ -9,12 +9,6 @@ import (
 	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
-const (
-	AutoRetryScheduled        = "scheduled"
-	AutoRetryStopped          = "stopped"
-	AutoRetryNoProgressReason = "auto-retry stopped: next step requires more than the configured window"
-)
-
 type Continuation struct {
 	TaskID     int64
 	EligibleAt time.Time
@@ -33,10 +27,8 @@ type StoppedContinuation struct {
 }
 
 type InitializedContinuation struct {
-	TaskID     int64
-	EligibleAt *time.Time
-	Stopped    bool
-	StopReason string
+	TaskID       int64
+	Continuation domain.ContinuationDecision
 }
 
 type ContinuationRepo struct {
@@ -55,7 +47,7 @@ func (r *ContinuationRepo) Next() (*Continuation, error) {
 		 ORDER BY next_eligible_at, id
 		 LIMIT 1`,
 		domain.TaskFailed,
-		AutoRetryScheduled,
+		domain.ContinuationScheduled,
 	)
 	var continuation Continuation
 	var eligibleAt string
@@ -111,7 +103,7 @@ func (r *ContinuationRepo) Stopped() ([]StoppedContinuation, error) {
 		 WHERE status = ? AND auto_retry_state = ?
 		 ORDER BY id`,
 		domain.TaskFailed,
-		AutoRetryStopped,
+		domain.ContinuationStopped,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query stopped continuations: %w", err)
@@ -167,18 +159,19 @@ func (r *ContinuationRepo) InitializeUnscheduled(
 		return nil, fmt.Errorf("parse unscheduled run finish: %w", err)
 	}
 
-	initialized := &InitializedContinuation{TaskID: taskID}
-	state := AutoRetryScheduled
-	reason := ""
+	completion, err := domain.DecideAttemptCompletion(
+		domain.AttemptTokenExhausted,
+		finished,
+		resetInterval,
+		tokensUsed > 0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("decide unscheduled continuation: %w", err)
+	}
+	decision := completion.Continuation()
+	initialized := &InitializedContinuation{TaskID: taskID, Continuation: decision}
 	var eligibleValue any
-	if tokensUsed == 0 {
-		initialized.Stopped = true
-		initialized.StopReason = AutoRetryNoProgressReason
-		state = AutoRetryStopped
-		reason = AutoRetryNoProgressReason
-	} else {
-		eligibleAt := finished.Add(resetInterval)
-		initialized.EligibleAt = &eligibleAt
+	if eligibleAt := decision.EligibleAt(); eligibleAt != nil {
 		eligibleValue = eligibleAt.Format(time.RFC3339Nano)
 	}
 	result, err := r.db.sql.Exec(
@@ -186,8 +179,8 @@ func (r *ContinuationRepo) InitializeUnscheduled(
 		 SET next_eligible_at = ?, auto_retry_state = ?, auto_retry_reason = ?
 		 WHERE id = ? AND status = ? AND auto_retry_state = '' AND next_eligible_at IS NULL`,
 		eligibleValue,
-		state,
-		reason,
+		decision.Kind(),
+		decision.Reason(),
 		taskID,
 		domain.TaskFailed,
 	)

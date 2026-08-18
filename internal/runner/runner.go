@@ -52,13 +52,68 @@ type leaseRenewal struct {
 	cancel context.CancelFunc
 }
 
+type attemptTerminalization struct {
+	completion    domain.AttemptCompletion
+	errorText     string
+	commentAuthor string
+	commentBody   string
+}
+
+func terminalizeCheckpoint(
+	session *agent.Session,
+	checkpoint agent.AttemptCheckpoint,
+	startStep int,
+	finishedAt time.Time,
+	resetInterval time.Duration,
+	interruptionError string,
+) (attemptTerminalization, error) {
+	terminal := attemptTerminalization{}
+	var outcome domain.AttemptOutcome
+	switch checkpoint.HaltReason {
+	case agent.HaltCompleted:
+		outcome = domain.AttemptCompleted
+		terminal.commentAuthor = "agent"
+		terminal.commentBody = agent.Summary(session)
+	case agent.HaltAgentError:
+		outcome = domain.AttemptAgentError
+		terminal.errorText = checkpoint.Error
+	case agent.HaltTokenExhausted:
+		outcome = domain.AttemptTokenExhausted
+	case agent.HaltInterrupted, agent.HaltRunning, "":
+		outcome = domain.AttemptInterrupted
+		terminal.errorText = interruptionError
+	default:
+		return attemptTerminalization{}, fmt.Errorf(
+			"unknown attempt halt reason %q",
+			checkpoint.HaltReason,
+		)
+	}
+	completion, err := domain.DecideAttemptCompletion(
+		outcome,
+		finishedAt,
+		resetInterval,
+		checkpoint.CompletedSteps > startStep,
+	)
+	if err != nil {
+		return attemptTerminalization{}, err
+	}
+	terminal.completion = completion
+	return terminal, nil
+}
+
 func RecoverExpired(
 	deps Deps,
 	run *domain.Run,
 	resetInterval time.Duration,
 	now time.Time,
 ) error {
-	session, err := agent.Load(deps.DataDir, run.SessionID)
+	var session *agent.Session
+	var err error
+	if run.SessionCheckpoint != "" {
+		session, err = agent.Restore(deps.DataDir, run.SessionCheckpoint)
+	} else {
+		session, err = agent.Load(deps.DataDir, run.SessionID)
+	}
 	if err != nil {
 		return fmt.Errorf("load expired run session: %w", err)
 	}
@@ -82,49 +137,37 @@ func RecoverExpired(
 	if checkpoint.OwnerToken != run.OwnerToken {
 		return fmt.Errorf("reconcile run %d: session owner token does not match", run.ID)
 	}
+	sessionCheckpoint, err := session.Checkpoint()
+	if err != nil {
+		return fmt.Errorf("encode expired run checkpoint: %w", err)
+	}
 
+	terminal, err := terminalizeCheckpoint(
+		session,
+		checkpoint,
+		run.StartStep,
+		now,
+		resetInterval,
+		"process exited before attempt finalization",
+	)
+	if err != nil {
+		return fmt.Errorf("reconcile run %d: %w", run.ID, err)
+	}
 	params := store.FinishAttemptParams{
-		RunID:          run.ID,
-		TaskID:         run.TaskID,
-		Outcome:        domain.AttemptInterrupted,
-		Output:         checkpoint.Output,
-		TokensUsed:     checkpoint.TokensUsed,
-		Error:          "process exited before attempt finalization",
-		FinishedAt:     now,
-		LeaseCheckedAt: now,
-		RecoverExpired: true,
-	}
-	switch checkpoint.HaltReason {
-	case agent.HaltCompleted:
-		params.Outcome = domain.AttemptCompleted
-		params.Error = ""
-		params.CommentAuthor = "agent"
-		params.CommentBody = agent.Summary(session)
-	case agent.HaltAgentError:
-		params.Outcome = domain.AttemptAgentError
-		params.Error = checkpoint.Error
-	case agent.HaltTokenExhausted:
-		params.Outcome = domain.AttemptTokenExhausted
-		params.Error = ""
-		completedDelta := checkpoint.CompletedSteps - run.StartStep
-		if completedDelta == 0 {
-			params.AutoRetryState = store.AutoRetryStopped
-			params.AutoRetryReason = store.AutoRetryNoProgressReason
-			break
-		}
-		next := now.Add(resetInterval)
-		params.NextEligibleAt = &next
-		params.AutoRetryState = store.AutoRetryScheduled
-	case agent.HaltInterrupted, agent.HaltRunning, "":
-		params.Outcome = domain.AttemptInterrupted
-		next := now
-		params.NextEligibleAt = &next
-		params.AutoRetryState = store.AutoRetryScheduled
-	default:
-		return fmt.Errorf("reconcile run %d: unknown halt reason %q", run.ID, checkpoint.HaltReason)
+		RunID:             run.ID,
+		TaskID:            run.TaskID,
+		Completion:        terminal.completion,
+		Output:            checkpoint.Output,
+		TokensUsed:        checkpoint.TokensUsed,
+		Error:             terminal.errorText,
+		CommentAuthor:     terminal.commentAuthor,
+		CommentBody:       terminal.commentBody,
+		FinishedAt:        now,
+		LeaseCheckedAt:    now,
+		SessionCheckpoint: sessionCheckpoint,
 	}
 
-	if err := deps.Attempts.FinishAttempt(params); err != nil {
+	if err := deps.Attempts.RecoverExpiredAttempt(params); err != nil {
 		return fmt.Errorf("finalize expired run %d: %w", run.ID, err)
 	}
 	return nil
@@ -191,16 +234,24 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 	if candidate.RunID == 0 {
 		return AttemptResult{}, fmt.Errorf("task %d has no terminal run to resume", taskID)
 	}
+	if candidate.Continuation.Kind() == domain.ContinuationStopped {
+		return AttemptResult{}, fmt.Errorf(
+			"task %d cannot be resumed: %s",
+			taskID,
+			candidate.Continuation.Reason(),
+		)
+	}
 	now := time.Now().UTC()
 	if deps.Options.Now != nil {
 		now = deps.Options.Now().UTC()
 	}
-	if candidate.NextEligibleAt != nil && now.Before(*candidate.NextEligibleAt) {
+	nextEligibleAt := candidate.Continuation.EligibleAt()
+	if nextEligibleAt != nil && now.Before(*nextEligibleAt) {
 		return AttemptResult{}, fmt.Errorf(
 			"task %d cannot be resumed until %s (%s remaining)",
 			taskID,
-			candidate.NextEligibleAt.Format(time.RFC3339),
-			candidate.NextEligibleAt.Sub(now).Round(time.Second),
+			nextEligibleAt.Format(time.RFC3339),
+			nextEligibleAt.Sub(now).Round(time.Second),
 		)
 	}
 
@@ -208,7 +259,14 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 	if deps.Options.NoDelay {
 		opts = append(opts, agent.WithNoDelay())
 	}
-	session, err := agent.Load(deps.DataDir, candidate.SessionID, opts...)
+	if candidate.SessionCheckpoint == "" {
+		return AttemptResult{}, fmt.Errorf(
+			"task %d cannot resume run %d without a session checkpoint",
+			taskID,
+			candidate.RunID,
+		)
+	}
+	session, err := agent.Restore(deps.DataDir, candidate.SessionCheckpoint, opts...)
 	if err != nil {
 		return AttemptResult{}, fmt.Errorf("load agent session: %w", err)
 	}
@@ -274,7 +332,18 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 	var outputLines []string
 	var outputErr error
 	var progressErr error
-	outcome, runErr := session.Run(attemptCtx, func(e agent.Event) {
+	leaseDuration := deps.Options.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = defaultLeaseDuration
+	}
+	outcome, runErr := session.RunFenced(attemptCtx, func() error {
+		return deps.Attempts.RenewLease(
+			run.ID,
+			run.OwnerToken,
+			time.Now().UTC(),
+			leaseDuration,
+		)
+	}, func(e agent.Event) {
 		outputLines = append(outputLines, e.Output)
 		if deps.Output != nil && outputErr == nil {
 			if _, err := fmt.Fprintln(deps.Output, e.Output); err != nil {
@@ -283,12 +352,19 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 		}
 		if progressErr == nil {
 			accumulated := strings.Join(outputLines, "\n")
+			checkpoint, err := session.Checkpoint()
+			if err != nil {
+				progressErr = err
+				cancel()
+				return
+			}
 			if err := deps.Attempts.UpdateProgress(store.AttemptProgress{
 				RunID:      run.ID,
 				OwnerToken: run.OwnerToken,
 				ObservedAt: time.Now().UTC(),
 				Output:     accumulated,
 				TokensUsed: e.TokensUsed,
+				Checkpoint: checkpoint,
 			}); err != nil {
 				progressErr = fmt.Errorf("update run progress: %w", err)
 				if errors.Is(err, domain.ErrLeaseLost) {
@@ -310,69 +386,44 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 	}
 
 	fullOutput := strings.Join(outputLines, "\n")
-	params := store.FinishAttemptParams{
-		RunID:      run.ID,
-		TaskID:     taskID,
-		OwnerToken: run.OwnerToken,
-		Output:     fullOutput,
-		TokensUsed: session.TokensUsed(),
+	checkpoint, err := session.Checkpoint()
+	if err != nil {
+		return AttemptResult{}, fmt.Errorf("encode final session checkpoint: %w", err)
 	}
-	if deps.Options.Now != nil {
-		params.FinishedAt = deps.Options.Now().UTC()
+	params := store.FinishAttemptParams{
+		RunID:             run.ID,
+		TaskID:            taskID,
+		OwnerToken:        run.OwnerToken,
+		Output:            fullOutput,
+		TokensUsed:        session.TokensUsed(),
+		SessionCheckpoint: checkpoint,
 	}
 	params.LeaseCheckedAt = time.Now().UTC()
-	result := AttemptResult{}
-	switch outcome.Kind {
-	case agent.Completed:
-		params.Outcome = domain.AttemptCompleted
-		params.CommentAuthor = "agent"
-		params.CommentBody = agent.Summary(session)
-		result = AttemptResult{Outcome: domain.AttemptCompleted}
-
-	case agent.Errored:
-		errMsg := ""
-		if outcome.Err != nil {
-			errMsg = outcome.Err.Error()
-		}
-		params.Outcome = domain.AttemptAgentError
-		params.Error = errMsg
-		result = AttemptResult{Outcome: domain.AttemptAgentError}
-
-	case agent.TokenBudgetExhausted:
-		params.Outcome = domain.AttemptTokenExhausted
-		result = AttemptResult{Outcome: domain.AttemptTokenExhausted}
-		if deps.Options.ResetInterval > 0 {
-			completedSteps := session.CompletedSteps() - startStep
-			if completedSteps == 0 {
-				params.AutoRetryState = store.AutoRetryStopped
-				params.AutoRetryReason = store.AutoRetryNoProgressReason
-				break
-			}
-			now := time.Now().UTC()
-			if deps.Options.Now != nil {
-				now = deps.Options.Now().UTC()
-			}
-			next := now.Add(deps.Options.ResetInterval)
-			params.NextEligibleAt = &next
-			params.AutoRetryState = store.AutoRetryScheduled
-		}
-
-	case agent.Interrupted:
-		params.Outcome = domain.AttemptInterrupted
-		if outcome.Err != nil {
-			params.Error = outcome.Err.Error()
-		}
-		now := time.Now().UTC()
-		if deps.Options.Now != nil {
-			now = deps.Options.Now().UTC()
-		}
-		params.NextEligibleAt = &now
-		params.AutoRetryState = store.AutoRetryScheduled
-		result = AttemptResult{Outcome: domain.AttemptInterrupted}
-
-	default:
-		return AttemptResult{}, fmt.Errorf("unknown agent outcome: %d", outcome.Kind)
+	finishedAt := time.Now().UTC()
+	if deps.Options.Now != nil {
+		finishedAt = deps.Options.Now().UTC()
 	}
+	interruptionError := ""
+	if outcome.Err != nil {
+		interruptionError = outcome.Err.Error()
+	}
+	terminal, err := terminalizeCheckpoint(
+		session,
+		session.AttemptCheckpoint(),
+		startStep,
+		finishedAt,
+		deps.Options.ResetInterval,
+		interruptionError,
+	)
+	if err != nil {
+		return AttemptResult{}, err
+	}
+	params.Completion = terminal.completion
+	params.Error = terminal.errorText
+	params.CommentAuthor = terminal.commentAuthor
+	params.CommentBody = terminal.commentBody
+	params.FinishedAt = finishedAt
+	result := AttemptResult{Outcome: terminal.completion.Outcome()}
 
 	if err := deps.Attempts.FinishAttempt(params); err != nil {
 		return AttemptResult{}, errors.Join(

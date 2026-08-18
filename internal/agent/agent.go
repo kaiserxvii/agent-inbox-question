@@ -164,9 +164,35 @@ func Load(dataDir, sessionID string, opts ...Option) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load session %s: %w", sessionID, err)
 	}
+	state, err := decodeState(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse session %s: %w", sessionID, err)
+	}
+	s := &Session{state: state, dataDir: dataDir}
+	for _, o := range opts {
+		o(s)
+	}
+	return s, nil
+}
+
+// Restore reconstructs a session from an authoritative checkpoint rather than
+// the mutable compatibility file in sessions/.
+func Restore(dataDir, checkpoint string, opts ...Option) (*Session, error) {
+	state, err := decodeState([]byte(checkpoint))
+	if err != nil {
+		return nil, fmt.Errorf("parse session checkpoint: %w", err)
+	}
+	s := &Session{state: state, dataDir: dataDir}
+	for _, o := range opts {
+		o(s)
+	}
+	return s, nil
+}
+
+func decodeState(data []byte) (SessionState, error) {
 	var state SessionState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("parse session %s: %w", sessionID, err)
+		return SessionState{}, err
 	}
 	if state.BudgetModelVersion < 2 {
 		state.BudgetModelVersion = 2
@@ -179,11 +205,7 @@ func Load(dataDir, sessionID string, opts ...Option) (*Session, error) {
 		}
 		state.LegacyTokenBudget = 0
 	}
-	s := &Session{state: state, dataDir: dataDir}
-	for _, o := range opts {
-		o(s)
-	}
-	return s, nil
+	return state, nil
 }
 
 func (s *Session) ID() string            { return s.state.ID }
@@ -192,6 +214,14 @@ func (s *Session) AttemptAllowance() int { return s.state.AttemptTokenAllowance 
 func (s *Session) RemainingBudget() int  { return s.state.TokensRemaining }
 func (s *Session) TokensUsed() int       { return s.state.TokensUsed }
 func (s *Session) CompletedSteps() int   { return s.state.NextStep }
+
+func (s *Session) Checkpoint() (string, error) {
+	data, err := json.Marshal(s.state)
+	if err != nil {
+		return "", fmt.Errorf("marshal session checkpoint: %w", err)
+	}
+	return string(data), nil
+}
 
 // BeginAttempt applies an explicit provider-window allowance to the next
 // attempt. It only changes in-memory attempt state; Run persists that state as
@@ -253,6 +283,27 @@ func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
 }
 
 func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error) {
+	return s.run(ctx, nil, onEvent)
+}
+
+// RunFenced verifies ownership immediately before every simulated step. A
+// failed fence returns without mutating or persisting that step.
+func (s *Session) RunFenced(
+	ctx context.Context,
+	fence func() error,
+	onEvent func(Event),
+) (Outcome, error) {
+	if fence == nil {
+		return Outcome{}, errors.New("step fence is required")
+	}
+	return s.run(ctx, fence, onEvent)
+}
+
+func (s *Session) run(
+	ctx context.Context,
+	fence func() error,
+	onEvent func(Event),
+) (Outcome, error) {
 	failAt := -1
 	if s.state.ErroredAt > 0 {
 		failAt = s.state.ErroredAt
@@ -267,6 +318,11 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 			}
 			return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 		default:
+		}
+		if fence != nil {
+			if err := fence(); err != nil {
+				return Outcome{}, err
+			}
 		}
 
 		step := &s.state.Steps[s.state.NextStep]
@@ -303,6 +359,11 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 				}
 				return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 			case <-timer.C:
+			}
+			if fence != nil {
+				if err := fence(); err != nil {
+					return Outcome{}, err
+				}
 			}
 		}
 

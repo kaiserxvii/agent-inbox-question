@@ -21,7 +21,7 @@ func (r *RunRepo) ListByTask(taskID int64) ([]*domain.Run, error) {
 	rows, err := r.db.sql.Query(
 		`SELECT id, task_id, session_id, status, exit_reason, output,
 		        tokens_used, token_budget, error, started_at, finished_at,
-		        owner_token, lease_expires_at, start_step
+		        owner_token, lease_expires_at, start_step, session_checkpoint
 		 FROM runs WHERE task_id = ? ORDER BY id`, taskID,
 	)
 	if err != nil {
@@ -44,7 +44,7 @@ func (r *RunRepo) LatestByTask(taskID int64) (*domain.Run, error) {
 	row := r.db.sql.QueryRow(
 		`SELECT id, task_id, session_id, status, exit_reason, output,
 		        tokens_used, token_budget, error, started_at, finished_at,
-		        owner_token, lease_expires_at, start_step
+		        owner_token, lease_expires_at, start_step, session_checkpoint
 		 FROM runs WHERE task_id = ? ORDER BY id DESC LIMIT 1`,
 		taskID,
 	)
@@ -70,6 +70,7 @@ func scanRunFrom(s scanner) (*domain.Run, error) {
 		&run.ID, &run.TaskID, &run.SessionID, &status, &exitReason,
 		&run.Output, &run.TokensUsed, &run.TokenBudget, &run.Error,
 		&startedAt, &finishedAt, &run.OwnerToken, &leaseExpiresAt, &run.StartStep,
+		&run.SessionCheckpoint,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrNotFound

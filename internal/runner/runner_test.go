@@ -3,12 +3,16 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -350,6 +354,55 @@ func TestResumeRetriesTransientAgentErrorWithoutRepeatingCompletedWork(t *testin
 	}
 }
 
+func TestResumeIgnoresARewoundSessionFile(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	task := createTask(t, tasks, "fenced checkpoint", "[steps:4] [budget:500]")
+	if err := Execute(context.Background(), deps, task.ID); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	before := listRuns(t, runs, task.ID)
+	if len(before) != 1 || before[0].Status != domain.RunTokenExhausted {
+		t.Fatalf("initial runs = %#v, want one exhausted attempt", before)
+	}
+	if got := strings.Count(before[0].Output, "[step "); got == 0 {
+		t.Fatal("initial attempt made no progress")
+	}
+
+	path := filepath.Join(deps.DataDir, "sessions", before[0].SessionID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read session file: %v", err)
+	}
+	var stale agent.SessionState
+	if err := json.Unmarshal(data, &stale); err != nil {
+		t.Fatalf("parse session file: %v", err)
+	}
+	stale.NextStep = 0
+	stale.Completed = false
+	for index := range stale.Steps {
+		stale.Steps[index].Done = false
+		stale.Steps[index].Output = ""
+	}
+	data, err = json.Marshal(stale)
+	if err != nil {
+		t.Fatalf("marshal stale session: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("rewind session file: %v", err)
+	}
+
+	if _, err := Resume(context.Background(), deps, task.ID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	after := listRuns(t, runs, task.ID)
+	if len(after) != 2 {
+		t.Fatalf("runs = %d, want 2", len(after))
+	}
+	if strings.Contains(after[1].Output, "[step 1/4]") {
+		t.Errorf("resume repeated checkpointed work: %q", after[1].Output)
+	}
+}
+
 func TestResumeReportsAnotherTokenExhaustion(t *testing.T) {
 	deps, tasks, runs, _ := setupTest(t)
 
@@ -405,6 +458,40 @@ func TestResumeRejectsTokenExhaustedTaskBeforeReset(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "1h0m0s remaining") {
 		t.Errorf("Resume error omits remaining duration: %v", err)
+	}
+	if count, err := runs.CountByTask(task.ID); err != nil {
+		t.Fatalf("CountByTask: %v", err)
+	} else if count != 1 {
+		t.Errorf("runs = %d, want 1", count)
+	}
+}
+
+func TestResumePreservesStoppedContinuationUntilConfigurationChanges(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	deps.Options = Options{
+		NoDelay:       true,
+		Now:           func() time.Time { return now },
+		ResetInterval: time.Hour,
+	}
+	task := createTask(t, tasks, "oversized step", "[steps:1] [budget:1]")
+	if err := Execute(context.Background(), deps, task.ID); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	stopped := getTask(t, tasks, task.ID)
+	wantEligible := now.Add(time.Hour)
+	if stopped.Continuation.EligibleAt() == nil || !stopped.Continuation.EligibleAt().Equal(wantEligible) {
+		t.Fatalf("next eligibility = %v, want %s", stopped.Continuation.EligibleAt(), wantEligible)
+	}
+
+	now = wantEligible.Add(time.Hour)
+	_, err := Resume(context.Background(), deps, task.ID)
+	if err == nil {
+		t.Fatal("Resume returned nil for a durably stopped continuation")
+	}
+	if !strings.Contains(err.Error(), domain.AutoRetryNoProgressReason) {
+		t.Errorf("Resume error = %q, want durable stopped reason", err)
 	}
 	if count, err := runs.CountByTask(task.ID); err != nil {
 		t.Fatalf("CountByTask: %v", err)
@@ -697,6 +784,162 @@ func TestConcurrentResumeAllowsExactlyOneAttempt(t *testing.T) {
 	if len(runList) != 2 {
 		t.Errorf("runs = %d, want 2 (initial attempt plus one resume)", len(runList))
 	}
+}
+
+func TestLeaseTakeoverFencesPausedExecutorSubprocess(t *testing.T) {
+	if os.Getenv("AGENT_INBOX_TAKEOVER_HELPER") == "1" {
+		t.Skip("parent-only test")
+	}
+	deps, tasks, runs, _ := setupTest(t)
+	deps.Output = nil
+	task := createTask(t, tasks, "takeover task", "[steps:1] [budget:5000]")
+
+	command := exec.Command(os.Args[0], "-test.run=^TestLeaseTakeoverHelper$")
+	command.Env = append(
+		os.Environ(),
+		"AGENT_INBOX_TAKEOVER_HELPER=1",
+		"AGENT_INBOX_TAKEOVER_DIR="+deps.DataDir,
+		"AGENT_INBOX_TAKEOVER_TASK="+strconv.FormatInt(task.ID, 10),
+	)
+	var subprocessOutput bytes.Buffer
+	command.Stdout = &subprocessOutput
+	command.Stderr = &subprocessOutput
+	if err := command.Start(); err != nil {
+		t.Fatalf("start paused executor: %v", err)
+	}
+	defer func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_, _ = command.Process.Wait()
+		}
+	}()
+
+	readyPath := filepath.Join(deps.DataDir, "takeover-ready")
+	waitForFile(t, readyPath, time.Second, "paused executor readiness")
+	if err := command.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("pause old executor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(deps.DataDir, "takeover-go"), nil, 0o644); err != nil {
+		t.Fatalf("release marker: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	takeoverAt := time.Now().UTC()
+	expired, err := deps.Attempts.NextExpired(takeoverAt)
+	if err != nil {
+		t.Fatalf("NextExpired: %v", err)
+	}
+	if err := RecoverExpired(deps, expired, time.Hour, takeoverAt); err != nil {
+		t.Fatalf("RecoverExpired: %v", err)
+	}
+	deps.Options = Options{NoDelay: true, Now: func() time.Time { return takeoverAt }}
+	if _, err := Resume(context.Background(), deps, task.ID); err != nil {
+		t.Fatalf("Resume takeover: %v", err)
+	}
+
+	if err := command.Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatalf("resume old executor: %v", err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("old executor exit: %v\n%s", err, subprocessOutput.String())
+	}
+	result, err := os.ReadFile(filepath.Join(deps.DataDir, "takeover-result"))
+	if err != nil {
+		t.Fatalf("read old executor result: %v", err)
+	}
+	if string(result) != "lease-lost:0" {
+		t.Errorf("old executor result = %q, want lease-lost with no executed steps", result)
+	}
+	history := listRuns(t, runs, task.ID)
+	if len(history) != 2 {
+		t.Fatalf("runs = %d, want expired attempt and one takeover", len(history))
+	}
+	if history[1].Status != domain.RunSucceeded || strings.Count(history[1].Output, "[step ") != 1 {
+		t.Errorf("takeover run = %#v, want one uniquely executed step", history[1])
+	}
+}
+
+func TestLeaseTakeoverHelper(t *testing.T) {
+	if os.Getenv("AGENT_INBOX_TAKEOVER_HELPER") != "1" {
+		t.Skip("subprocess helper")
+	}
+	dataDir := os.Getenv("AGENT_INBOX_TAKEOVER_DIR")
+	taskID, err := strconv.ParseInt(os.Getenv("AGENT_INBOX_TAKEOVER_TASK"), 10, 64)
+	if err != nil {
+		t.Fatalf("parse task ID: %v", err)
+	}
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tasks := store.NewTaskRepo(db)
+	attempts := store.NewAttemptRepo(db)
+	task, err := tasks.Get(taskID)
+	if err != nil {
+		t.Fatalf("Get task: %v", err)
+	}
+	session, err := agent.Start(dataDir, task.Title, task.Description, nil, agent.WithNoDelay())
+	if err != nil {
+		t.Fatalf("Start session: %v", err)
+	}
+	run, err := attempts.StartOwnedAttempt(store.StartAttemptParams{
+		TaskID:         task.ID,
+		ExpectedStatus: domain.TaskTodo,
+		SessionID:      session.ID(),
+		TokenBudget:    session.AttemptAllowance(),
+		StartedAt:      time.Now().UTC(),
+		LeaseDuration:  200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("StartOwnedAttempt: %v", err)
+	}
+	if err := session.BindAttempt(run.ID, run.OwnerToken); err != nil {
+		t.Fatalf("BindAttempt: %v", err)
+	}
+	checkpoint, err := session.Checkpoint()
+	if err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := attempts.UpdateProgress(store.AttemptProgress{
+		RunID:      run.ID,
+		OwnerToken: run.OwnerToken,
+		ObservedAt: time.Now().UTC(),
+		Checkpoint: checkpoint,
+	}); err != nil {
+		t.Fatalf("publish initial checkpoint: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "takeover-ready"), nil, 0o644); err != nil {
+		t.Fatalf("write ready marker: %v", err)
+	}
+	waitForFile(t, filepath.Join(dataDir, "takeover-go"), 5*time.Second, "takeover release")
+	executed := 0
+	_, err = session.RunFenced(context.Background(), func() error {
+		return attempts.RenewLease(run.ID, run.OwnerToken, time.Now().UTC(), 200*time.Millisecond)
+	}, func(agent.Event) {
+		executed++
+	})
+	result := fmt.Sprintf("unexpected:%d", executed)
+	if errors.Is(err, domain.ErrLeaseLost) {
+		result = fmt.Sprintf("lease-lost:%d", executed)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "takeover-result"), []byte(result), 0o644); err != nil {
+		t.Fatalf("write result: %v", err)
+	}
+}
+
+func waitForFile(t *testing.T, path string, timeout time.Duration, description string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat %s: %v", description, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
 }
 
 func TestExecuteConflict(t *testing.T) {

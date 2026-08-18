@@ -85,9 +85,9 @@ func (s *Server) Run(ctx context.Context) error {
 			s.deps.Logger.Info(
 				"initialized automatic continuation",
 				"task_id", initialized.TaskID,
-				"eligible_at", initialized.EligibleAt,
-				"stopped", initialized.Stopped,
-				"reason", initialized.StopReason,
+				"eligible_at", initialized.Continuation.EligibleAt(),
+				"state", initialized.Continuation.Kind(),
+				"reason", initialized.Continuation.Reason(),
 			)
 			continue
 		}
@@ -179,9 +179,9 @@ func (s *Server) Run(ctx context.Context) error {
 			"task_id", continuation.TaskID,
 			"outcome", result.Outcome,
 			"task_status", task.Status,
-			"auto_retry_state", task.AutoRetryState,
-			"auto_retry_reason", task.AutoRetryReason,
-			"next_eligible_at", task.NextEligibleAt,
+			"auto_retry_state", task.Continuation.Kind(),
+			"auto_retry_reason", task.Continuation.Reason(),
+			"next_eligible_at", task.Continuation.EligibleAt(),
 		)
 	}
 }

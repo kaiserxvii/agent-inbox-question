@@ -147,6 +147,7 @@ func scanTaskFrom(s scanner) (*domain.Task, error) {
 	var status string
 	var createdAt, updatedAt string
 	var nextEligibleAt sql.NullString
+	var autoRetryState, autoRetryReason string
 	if err := s.Scan(
 		&t.ID,
 		&t.Title,
@@ -155,8 +156,8 @@ func scanTaskFrom(s scanner) (*domain.Task, error) {
 		&createdAt,
 		&updatedAt,
 		&nextEligibleAt,
-		&t.AutoRetryState,
-		&t.AutoRetryReason,
+		&autoRetryState,
+		&autoRetryReason,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, domain.ErrNotFound
@@ -178,7 +179,15 @@ func scanTaskFrom(s scanner) (*domain.Task, error) {
 		if parseErr != nil {
 			return nil, fmt.Errorf("parse next_eligible_at: %w", parseErr)
 		}
-		t.NextEligibleAt = &next
+		t.Continuation, err = domain.ParseContinuation(autoRetryState, &next, autoRetryReason)
+		if err != nil {
+			return nil, fmt.Errorf("parse continuation: %w", err)
+		}
+	} else {
+		t.Continuation, err = domain.ParseContinuation(autoRetryState, nil, autoRetryReason)
+		if err != nil {
+			return nil, fmt.Errorf("parse continuation: %w", err)
+		}
 	}
 	return &t, nil
 }

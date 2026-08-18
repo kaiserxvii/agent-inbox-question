@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -23,6 +24,26 @@ func openTestDB(t *testing.T) *DB {
 		}
 	})
 	return db
+}
+
+func completionForTest(
+	t *testing.T,
+	outcome domain.AttemptOutcome,
+	finishedAt time.Time,
+	resetInterval time.Duration,
+	progressed bool,
+) domain.AttemptCompletion {
+	t.Helper()
+	completion, err := domain.DecideAttemptCompletion(
+		outcome,
+		finishedAt,
+		resetInterval,
+		progressed,
+	)
+	if err != nil {
+		t.Fatalf("DecideAttemptCompletion: %v", err)
+	}
+	return completion
 }
 
 func TestTaskCRUD(t *testing.T) {
@@ -148,6 +169,119 @@ func TestMigrationIdempotency(t *testing.T) {
 	db2.Close()
 }
 
+func TestMigrationRollsBackDDLWhenVersionCannotBeRecorded(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "inbox.db")
+	seedVersionThreeDatabase(t, dbPath)
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open seeded database: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TRIGGER reject_migration_four_version
+		BEFORE INSERT ON schema_migrations
+		WHEN NEW.version = 4
+		BEGIN
+			SELECT RAISE(ABORT, 'version record rejected');
+		END`); err != nil {
+		raw.Close()
+		t.Fatalf("create version rejection trigger: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close seeded database: %v", err)
+	}
+
+	if db, err := Open(dir); err == nil {
+		db.Close()
+		t.Fatal("Open succeeded despite injected migration failure")
+	}
+
+	raw, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen seeded database: %v", err)
+	}
+	defer raw.Close()
+	rows, err := raw.Query("PRAGMA table_info(tasks)")
+	if err != nil {
+		t.Fatalf("read task columns: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan task column: %v", err)
+		}
+		if name == "next_eligible_at" || name == "auto_retry_state" || name == "auto_retry_reason" {
+			t.Errorf("partially applied column %q survived failed migration", name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate task columns: %v", err)
+	}
+}
+
+func TestConcurrentOpenSerializesMigrations(t *testing.T) {
+	dir := t.TempDir()
+	seedVersionThreeDatabase(t, filepath.Join(dir, "inbox.db"))
+
+	start := make(chan struct{})
+	errors := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			db, err := Open(dir)
+			if err == nil {
+				err = db.Close()
+			}
+			errors <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errors; err != nil {
+			t.Errorf("concurrent Open: %v", err)
+		}
+	}
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open migrated database: %v", err)
+	}
+	defer db.Close()
+	if _, err := NewTaskRepo(db).Create("restart-safe", ""); err != nil {
+		t.Fatalf("use migrated database: %v", err)
+	}
+}
+
+func seedVersionThreeDatabase(t *testing.T, dbPath string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open seed database: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create seed migration table: %v", err)
+	}
+	for _, migration := range migrations[:3] {
+		if _, err := raw.Exec(migration.sql); err != nil {
+			t.Fatalf("apply seed migration %d: %v", migration.version, err)
+		}
+		if _, err := raw.Exec(
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
+			migration.version,
+		); err != nil {
+			t.Fatalf("record seed migration %d: %v", migration.version, err)
+		}
+	}
+}
+
 func TestAttemptLifecycle(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
@@ -183,7 +317,7 @@ func TestAttemptLifecycle(t *testing.T) {
 		RunID:      run.ID,
 		TaskID:     task.ID,
 		OwnerToken: run.OwnerToken,
-		Outcome:    domain.AttemptCompleted,
+		Completion: completionForTest(t, domain.AttemptCompleted, time.Time{}, 0, false),
 		Output:     "final output",
 		TokensUsed: 800,
 	}); err != nil {
@@ -280,7 +414,7 @@ func TestStartAttemptRejectsAResumeOfAnAlreadyConsumedRun(t *testing.T) {
 		t.Fatalf("first StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Outcome: domain.AttemptTokenExhausted,
+		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Completion: completionForTest(t, domain.AttemptTokenExhausted, time.Time{}, 0, false),
 	}); err != nil {
 		t.Fatalf("first FinishAttempt: %v", err)
 	}
@@ -289,7 +423,7 @@ func TestStartAttemptRejectsAResumeOfAnAlreadyConsumedRun(t *testing.T) {
 		t.Fatalf("second StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: second.ID, TaskID: task.ID, OwnerToken: second.OwnerToken, Outcome: domain.AttemptTokenExhausted,
+		RunID: second.ID, TaskID: task.ID, OwnerToken: second.OwnerToken, Completion: completionForTest(t, domain.AttemptTokenExhausted, time.Time{}, 0, false),
 	}); err != nil {
 		t.Fatalf("second FinishAttempt: %v", err)
 	}
@@ -314,6 +448,58 @@ func TestStartAttemptRejectsAResumeOfAnAlreadyConsumedRun(t *testing.T) {
 	}
 }
 
+func TestStartAttemptAtomicallyRejectsResumeBeforeProviderReset(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("waiting", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	first, err := attempts.StartOwnedAttempt(StartAttemptParams{
+		TaskID:         task.ID,
+		ExpectedStatus: domain.TaskTodo,
+		SessionID:      "session",
+		TokenBudget:    1,
+		StartedAt:      now,
+		LeaseDuration:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("StartOwnedAttempt: %v", err)
+	}
+	if err := attempts.FinishAttempt(FinishAttemptParams{
+		RunID:          first.ID,
+		TaskID:         task.ID,
+		OwnerToken:     first.OwnerToken,
+		Completion:     completionForTest(t, domain.AttemptTokenExhausted, now, time.Hour, true),
+		FinishedAt:     now,
+		LeaseCheckedAt: now,
+	}); err != nil {
+		t.Fatalf("FinishAttempt: %v", err)
+	}
+
+	_, err = attempts.StartOwnedAttempt(StartAttemptParams{
+		TaskID:         task.ID,
+		ExpectedStatus: domain.TaskFailed,
+		ExpectedRunID:  first.ID,
+		SessionID:      "session",
+		TokenBudget:    1,
+		StartedAt:      now.Add(30 * time.Minute),
+		LeaseDuration:  time.Minute,
+	})
+	if !errors.Is(err, domain.ErrNotEligible) {
+		t.Fatalf("StartOwnedAttempt error = %v, want ErrNotEligible", err)
+	}
+	if count, err := runs.CountByTask(task.ID); err != nil {
+		t.Fatalf("CountByTask: %v", err)
+	} else if count != 1 {
+		t.Errorf("runs = %d, want 1", count)
+	}
+}
+
 func TestResumeCandidateSnapshotRejectsAConcurrentRefailure(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
@@ -329,7 +515,7 @@ func TestResumeCandidateSnapshotRejectsAConcurrentRefailure(t *testing.T) {
 		t.Fatalf("first StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Outcome: domain.AttemptTokenExhausted,
+		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Completion: completionForTest(t, domain.AttemptTokenExhausted, time.Time{}, 0, false),
 	}); err != nil {
 		t.Fatalf("first FinishAttempt: %v", err)
 	}
@@ -388,7 +574,7 @@ func TestResumeCandidateSnapshotRejectsAConcurrentRefailure(t *testing.T) {
 		t.Fatalf("concurrent StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: second.ID, TaskID: task.ID, OwnerToken: second.OwnerToken, Outcome: domain.AttemptTokenExhausted,
+		RunID: second.ID, TaskID: task.ID, OwnerToken: second.OwnerToken, Completion: completionForTest(t, domain.AttemptTokenExhausted, time.Time{}, 0, false),
 	}); err != nil {
 		t.Fatalf("concurrent FinishAttempt: %v", err)
 	}
@@ -436,7 +622,7 @@ func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
 		RunID:         run.ID,
 		TaskID:        task.ID + 1,
 		OwnerToken:    run.OwnerToken,
-		Outcome:       domain.AttemptCompleted,
+		Completion:    completionForTest(t, domain.AttemptCompleted, time.Time{}, 0, false),
 		Output:        "completed output",
 		TokensUsed:    500,
 		CommentAuthor: "agent",
@@ -466,47 +652,6 @@ func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
 	}
 	if got.Status != domain.TaskInProgress {
 		t.Errorf("task status = %q, want in_progress after rollback", got.Status)
-	}
-}
-
-func TestFinishAttemptRejectsUnknownOutcome(t *testing.T) {
-	db := openTestDB(t)
-	tasks := NewTaskRepo(db)
-	attempts := NewAttemptRepo(db)
-	runs := NewRunRepo(db)
-
-	task, err := tasks.Create("t", "")
-	if err != nil {
-		t.Fatalf("Create task: %v", err)
-	}
-	run, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1000)
-	if err != nil {
-		t.Fatalf("StartAttempt: %v", err)
-	}
-
-	err = attempts.FinishAttempt(FinishAttemptParams{
-		RunID:      run.ID,
-		TaskID:     task.ID,
-		OwnerToken: run.OwnerToken,
-		Outcome:    domain.AttemptOutcome("unknown"),
-	})
-	if err == nil {
-		t.Fatal("FinishAttempt returned nil for unknown outcome")
-	}
-
-	runList, err := runs.ListByTask(task.ID)
-	if err != nil {
-		t.Fatalf("ListByTask: %v", err)
-	}
-	if runList[0].Status != domain.RunRunning {
-		t.Errorf("run status = %q, want running", runList[0].Status)
-	}
-	got, err := tasks.Get(task.ID)
-	if err != nil {
-		t.Fatalf("Get task: %v", err)
-	}
-	if got.Status != domain.TaskInProgress {
-		t.Errorf("task status = %q, want in_progress", got.Status)
 	}
 }
 
@@ -591,7 +736,7 @@ func TestRunCountByTask(t *testing.T) {
 		t.Fatalf("first StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Outcome: domain.AttemptAgentError,
+		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Completion: completionForTest(t, domain.AttemptAgentError, time.Time{}, 0, false),
 	}); err != nil {
 		t.Fatalf("first FinishAttempt: %v", err)
 	}
@@ -674,6 +819,86 @@ func TestStaleAttemptOwnerCannotPublishProgress(t *testing.T) {
 	}
 }
 
+func TestStaleAttemptCannotRewindSuccessorCheckpoint(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("takeover", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	first, err := attempts.StartOwnedAttempt(StartAttemptParams{
+		TaskID:         task.ID,
+		ExpectedStatus: domain.TaskTodo,
+		SessionID:      "session",
+		TokenBudget:    1000,
+		StartedAt:      now,
+		LeaseDuration:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("start first attempt: %v", err)
+	}
+	if err := attempts.UpdateProgress(AttemptProgress{
+		RunID:      first.ID,
+		OwnerToken: first.OwnerToken,
+		ObservedAt: now.Add(30 * time.Second),
+		Checkpoint: `{"next_step":1}`,
+	}); err != nil {
+		t.Fatalf("publish first checkpoint: %v", err)
+	}
+	takeoverAt := now.Add(time.Minute)
+	if err := attempts.RecoverExpiredAttempt(FinishAttemptParams{
+		RunID:          first.ID,
+		TaskID:         task.ID,
+		Completion:     completionForTest(t, domain.AttemptInterrupted, time.Time{}, 0, false),
+		FinishedAt:     takeoverAt,
+		LeaseCheckedAt: takeoverAt,
+	}); err != nil {
+		t.Fatalf("recover first attempt: %v", err)
+	}
+	second, err := attempts.StartOwnedAttempt(StartAttemptParams{
+		TaskID:         task.ID,
+		ExpectedStatus: domain.TaskFailed,
+		ExpectedRunID:  first.ID,
+		SessionID:      "session",
+		TokenBudget:    1000,
+		StartedAt:      takeoverAt,
+		LeaseDuration:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("start successor attempt: %v", err)
+	}
+	const activeCheckpoint = `{"next_step":2}`
+	if err := attempts.UpdateProgress(AttemptProgress{
+		RunID:      second.ID,
+		OwnerToken: second.OwnerToken,
+		ObservedAt: takeoverAt.Add(time.Second),
+		Checkpoint: activeCheckpoint,
+	}); err != nil {
+		t.Fatalf("publish successor checkpoint: %v", err)
+	}
+
+	err = attempts.UpdateProgress(AttemptProgress{
+		RunID:      first.ID,
+		OwnerToken: first.OwnerToken,
+		ObservedAt: takeoverAt.Add(time.Second),
+		Checkpoint: `{"next_step":1}`,
+	})
+	if !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("stale checkpoint error = %v, want ErrLeaseLost", err)
+	}
+	active, err := runs.LatestByTask(task.ID)
+	if err != nil {
+		t.Fatalf("LatestByTask: %v", err)
+	}
+	if active.SessionCheckpoint != activeCheckpoint {
+		t.Errorf("active checkpoint = %q, want %q", active.SessionCheckpoint, activeCheckpoint)
+	}
+}
+
 func TestStaleAttemptOwnerCannotFinalizeRun(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
@@ -692,7 +917,7 @@ func TestStaleAttemptOwnerCannotFinalizeRun(t *testing.T) {
 		RunID:      run.ID,
 		TaskID:     task.ID,
 		OwnerToken: "stale-owner-token",
-		Outcome:    domain.AttemptCompleted,
+		Completion: completionForTest(t, domain.AttemptCompleted, time.Time{}, 0, false),
 		FinishedAt: time.Now().UTC(),
 	})
 	if !errors.Is(err, domain.ErrLeaseLost) {

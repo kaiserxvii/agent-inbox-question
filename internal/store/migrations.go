@@ -64,4 +64,8 @@ UPDATE runs SET lease_expires_at = started_at
 WHERE status = 'running' AND lease_expires_at IS NULL;
 CREATE INDEX idx_runs_expired_lease ON runs(status, lease_expires_at);`,
 	},
+	{
+		version: 6,
+		sql:     `ALTER TABLE runs ADD COLUMN session_checkpoint TEXT NOT NULL DEFAULT '';`,
+	},
 }

@@ -22,33 +22,29 @@ type AttemptRepo struct {
 // ResumeCandidate is the task state and terminal predecessor observed by one
 // database statement.
 type ResumeCandidate struct {
-	TaskStatus      domain.TaskStatus
-	RunID           int64
-	SessionID       string
-	ExitReason      domain.ExitReason
-	NextEligibleAt  *time.Time
-	AutoRetryState  string
-	AutoRetryReason string
+	TaskStatus        domain.TaskStatus
+	RunID             int64
+	SessionID         string
+	ExitReason        domain.ExitReason
+	Continuation      domain.ContinuationDecision
+	SessionCheckpoint string
 }
 
 // FinishAttemptParams describes the attempt data stored alongside its single
 // terminal outcome. CommentAuthor and CommentBody must both be set or empty.
 type FinishAttemptParams struct {
-	RunID           int64
-	TaskID          int64
-	OwnerToken      string
-	Outcome         domain.AttemptOutcome
-	Output          string
-	TokensUsed      int
-	Error           string
-	CommentAuthor   string
-	CommentBody     string
-	FinishedAt      time.Time
-	LeaseCheckedAt  time.Time
-	NextEligibleAt  *time.Time
-	AutoRetryState  string
-	AutoRetryReason string
-	RecoverExpired  bool
+	RunID             int64
+	TaskID            int64
+	OwnerToken        string
+	Output            string
+	TokensUsed        int
+	Error             string
+	CommentAuthor     string
+	CommentBody       string
+	FinishedAt        time.Time
+	LeaseCheckedAt    time.Time
+	SessionCheckpoint string
+	Completion        domain.AttemptCompletion
 }
 
 type StartAttemptParams struct {
@@ -68,6 +64,26 @@ type AttemptProgress struct {
 	ObservedAt time.Time
 	Output     string
 	TokensUsed int
+	Checkpoint string
+}
+
+type finishAuthorization func(FinishAttemptParams, time.Time) (string, []any)
+
+func ownerFinishAuthorization(
+	params FinishAttemptParams,
+	leaseCheckedAt time.Time,
+) (string, []any) {
+	return "owner_token = ? AND lease_expires_at > ?", []any{
+		params.OwnerToken,
+		leaseCheckedAt.Format(time.RFC3339Nano),
+	}
+}
+
+func expiredFinishAuthorization(
+	_ FinishAttemptParams,
+	leaseCheckedAt time.Time,
+) (string, []any) {
+	return "lease_expires_at <= ?", []any{leaseCheckedAt.Format(time.RFC3339Nano)}
 }
 
 func NewAttemptRepo(db *DB) *AttemptRepo {
@@ -84,7 +100,8 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 		        COALESCE(candidate.exit_reason, ''),
 		        tasks.next_eligible_at,
 		        tasks.auto_retry_state,
-		        tasks.auto_retry_reason
+		        tasks.auto_retry_reason,
+		        COALESCE(candidate.session_checkpoint, '')
 		 FROM tasks
 		 LEFT JOIN runs AS candidate ON candidate.id = (
 		   SELECT id
@@ -100,6 +117,7 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 	var status string
 	var exitReason string
 	var nextEligibleAt sql.NullString
+	var autoRetryState, autoRetryReason string
 	candidate := &ResumeCandidate{}
 	if err := row.Scan(
 		&status,
@@ -107,8 +125,9 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 		&candidate.SessionID,
 		&exitReason,
 		&nextEligibleAt,
-		&candidate.AutoRetryState,
-		&candidate.AutoRetryReason,
+		&autoRetryState,
+		&autoRetryReason,
+		&candidate.SessionCheckpoint,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrNotFound
@@ -122,17 +141,36 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 		if err != nil {
 			return nil, fmt.Errorf("parse resume eligibility: %w", err)
 		}
-		candidate.NextEligibleAt = &next
+		continuation, err := domain.ParseContinuation(
+			autoRetryState,
+			&next,
+			autoRetryReason,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("parse resume continuation: %w", err)
+		}
+		candidate.Continuation = continuation
+	} else {
+		continuation, err := domain.ParseContinuation(
+			autoRetryState,
+			nil,
+			autoRetryReason,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("parse resume continuation: %w", err)
+		}
+		candidate.Continuation = continuation
 	}
 	return candidate, nil
 }
 
 func (r *AttemptRepo) UpdateProgress(progress AttemptProgress) error {
 	result, err := r.db.sql.Exec(
-		`UPDATE runs SET output = ?, tokens_used = ?
+		`UPDATE runs SET output = ?, tokens_used = ?, session_checkpoint = ?
 		 WHERE id = ? AND status = ? AND owner_token = ? AND lease_expires_at > ?`,
 		progress.Output,
 		progress.TokensUsed,
+		progress.Checkpoint,
 		progress.RunID,
 		domain.RunRunning,
 		progress.OwnerToken,
@@ -182,7 +220,21 @@ func (r *AttemptRepo) RenewLease(
 // FinishAttempt atomically finalizes a run, transitions its task, and records
 // an optional comment.
 func (r *AttemptRepo) FinishAttempt(params FinishAttemptParams) error {
-	state, err := params.Outcome.TerminalState()
+	return r.finishAttempt(params, ownerFinishAuthorization)
+}
+
+// RecoverExpiredAttempt finalizes only a running attempt whose lease has
+// expired. It is deliberately separate from owner-authorized finalization.
+func (r *AttemptRepo) RecoverExpiredAttempt(params FinishAttemptParams) error {
+	return r.finishAttempt(params, expiredFinishAuthorization)
+}
+
+func (r *AttemptRepo) finishAttempt(
+	params FinishAttemptParams,
+	authorize finishAuthorization,
+) error {
+	completion := params.Completion
+	state, err := completion.Outcome().TerminalState()
 	if err != nil {
 		return fmt.Errorf("validate attempt outcome: %w", err)
 	}
@@ -211,33 +263,32 @@ func (r *AttemptRepo) FinishAttempt(params FinishAttemptParams) error {
 	if leaseCheckedAt.IsZero() {
 		leaseCheckedAt = time.Now().UTC()
 	}
+	continuation := completion.Continuation()
 	var nextEligibleAt any
-	if params.NextEligibleAt != nil {
-		nextEligibleAt = params.NextEligibleAt.UTC().Format(time.RFC3339Nano)
+	if eligibleAt := continuation.EligibleAt(); eligibleAt != nil {
+		nextEligibleAt = eligibleAt.UTC().Format(time.RFC3339Nano)
 	}
-	runResult, err := tx.Exec(
-		`UPDATE runs
-		 SET status = ?, exit_reason = ?, output = ?, tokens_used = ?, error = ?, finished_at = ?
-		 WHERE id = ? AND task_id = ? AND status = ?
-		   AND (
-		     (? = 0 AND owner_token = ? AND lease_expires_at > ?)
-		     OR
-		     (? = 1 AND lease_expires_at <= ?)
-		   )`,
+	authorization, authorizationArgs := authorize(params, leaseCheckedAt)
+	runArgs := []any{
 		state.RunStatus,
 		state.ExitReason,
 		params.Output,
 		params.TokensUsed,
 		params.Error,
 		now,
+		params.SessionCheckpoint,
 		params.RunID,
 		params.TaskID,
 		domain.RunRunning,
-		boolInt(params.RecoverExpired),
-		params.OwnerToken,
-		leaseCheckedAt.Format(time.RFC3339Nano),
-		boolInt(params.RecoverExpired),
-		leaseCheckedAt.Format(time.RFC3339Nano),
+	}
+	runArgs = append(runArgs, authorizationArgs...)
+	runResult, err := tx.Exec(
+		`UPDATE runs
+		 SET status = ?, exit_reason = ?, output = ?, tokens_used = ?, error = ?, finished_at = ?,
+		     session_checkpoint = ?
+		 WHERE id = ? AND task_id = ? AND status = ?
+		   AND `+authorization,
+		runArgs...,
 	)
 	if err != nil {
 		return rollback(fmt.Errorf("finish run: %w", err))
@@ -258,8 +309,8 @@ func (r *AttemptRepo) FinishAttempt(params FinishAttemptParams) error {
 		state.TaskStatus,
 		now,
 		nextEligibleAt,
-		params.AutoRetryState,
-		params.AutoRetryReason,
+		continuation.Kind(),
+		continuation.Reason(),
 		params.TaskID,
 		domain.TaskInProgress,
 	)
@@ -297,7 +348,7 @@ func (r *AttemptRepo) NextExpired(now time.Time) (*domain.Run, error) {
 	row := r.db.sql.QueryRow(
 		`SELECT id, task_id, session_id, status, exit_reason, output,
 		        tokens_used, token_budget, error, started_at, finished_at,
-		        owner_token, lease_expires_at, start_step
+		        owner_token, lease_expires_at, start_step, session_checkpoint
 		 FROM runs
 		 WHERE status = ? AND lease_expires_at <= ?
 		 ORDER BY lease_expires_at, id
@@ -365,6 +416,13 @@ func (r *AttemptRepo) StartOwnedAttempt(params StartAttemptParams) (*domain.Run,
 		     auto_retry_state = '', auto_retry_reason = ''
 		 WHERE id = ? AND status = ?
 		   AND (
+		     ? <> ?
+		     OR (
+		       auto_retry_state <> ?
+		       AND (next_eligible_at IS NULL OR julianday(next_eligible_at) <= julianday(?))
+		     )
+		   )
+		   AND (
 		     (? = 0 AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id = ?))
 		     OR
 		     (? <> 0 AND ? = (SELECT id FROM runs WHERE task_id = ? ORDER BY id DESC LIMIT 1))
@@ -373,6 +431,10 @@ func (r *AttemptRepo) StartOwnedAttempt(params StartAttemptParams) (*domain.Run,
 		nowStr,
 		params.TaskID,
 		params.ExpectedStatus,
+		params.ExpectedStatus,
+		domain.TaskFailed,
+		domain.ContinuationStopped,
+		nowStr,
 		params.ExpectedRunID,
 		params.TaskID,
 		params.ExpectedRunID,
@@ -389,15 +451,49 @@ func (r *AttemptRepo) StartOwnedAttempt(params StartAttemptParams) (*domain.Run,
 	if rows != 1 {
 		var observed domain.TaskStatus
 		var observedRunID int64
+		var nextEligibleAt sql.NullString
+		var autoRetryState string
+		var autoRetryReason string
 		if err := tx.QueryRow(
-			`SELECT status, COALESCE((SELECT MAX(id) FROM runs WHERE task_id = tasks.id), 0)
+			`SELECT status,
+			        COALESCE((SELECT MAX(id) FROM runs WHERE task_id = tasks.id), 0),
+			        next_eligible_at,
+			        auto_retry_state,
+			        auto_retry_reason
 			 FROM tasks WHERE id = ?`,
 			params.TaskID,
-		).Scan(&observed, &observedRunID); err != nil {
+		).Scan(
+			&observed,
+			&observedRunID,
+			&nextEligibleAt,
+			&autoRetryState,
+			&autoRetryReason,
+		); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return rollback(domain.ErrNotFound)
 			}
 			return rollback(fmt.Errorf("read conflicting task status: %w", err))
+		}
+		if params.ExpectedStatus == domain.TaskFailed &&
+			observed == params.ExpectedStatus &&
+			observedRunID == params.ExpectedRunID {
+			if autoRetryState == string(domain.ContinuationStopped) {
+				return rollback(fmt.Errorf("%w: %s", domain.ErrNotEligible, autoRetryReason))
+			}
+			if nextEligibleAt.Valid {
+				eligibleAt, err := time.Parse(time.RFC3339Nano, nextEligibleAt.String)
+				if err != nil {
+					return rollback(fmt.Errorf("parse conflicting eligibility: %w", err))
+				}
+				if eligibleAt.After(now) {
+					return rollback(fmt.Errorf(
+						"%w: task %d cannot be resumed until %s",
+						domain.ErrNotEligible,
+						params.TaskID,
+						nextEligibleAt.String,
+					))
+				}
+			}
 		}
 		return rollback(&domain.TaskStatusConflict{
 			TaskID:        params.TaskID,
@@ -452,11 +548,4 @@ func generateOwnerToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bytes), nil
-}
-
-func boolInt(value bool) int {
-	if value {
-		return 1
-	}
-	return 0
 }

@@ -167,16 +167,19 @@ internal/cli/              One file per command, table rendering
 
 The only external dependency is `modernc.org/sqlite` (pure-Go SQLite). No cobra,
 no uuid lib, no test framework — standard library only beyond the database driver.
+Schema discovery, every pending migration, and their version records run inside
+one `BEGIN IMMEDIATE` critical section, so failed or concurrent startup cannot
+expose a partially evolved schema.
 
 ### Resume model
 
 A task and an agent session span one or more runs. A run is a single attempt.
-`resume` snapshots the task status and latest terminal run in one database
-statement, loads that run's session without mutating it, explicitly begins a new
-budget window, then atomically claims the `failed` task and inserts the new
-`running` run before driving the remaining steps. A running run is never accepted
-as a resume predecessor. Earlier runs are append-only, and `show` groups each run
-with the output produced by that attempt.
+`resume` snapshots the task status, continuation decision, and latest terminal
+run in one database statement. It restores that run's authoritative SQLite
+checkpoint, explicitly begins a new budget window, then atomically claims the
+`failed` task and inserts the new `running` run before driving the remaining
+steps. A running run is never accepted as a resume predecessor. Earlier runs are
+append-only, and `show` groups each run with the output produced by that attempt.
 
 Attempt start is one SQLite transaction: it compare-and-swaps the task to
 `in_progress` and inserts the owning run. If either write fails, neither is kept.
@@ -191,14 +194,14 @@ comment are committed in one transaction. Callers supply one terminal attempt
 outcome; the run status, exit reason, and task status are derived together by the
 domain model, so inconsistent combinations cannot be supplied.
 
-Loading a session is pure: it preserves configured allowance, remaining allowance,
-attempt usage, and halt state exactly as persisted. Agent-error resumes start a
-fresh configured window. Token-exhausted resumes are rejected until their durable
-absolute eligibility timestamp. Interrupted attempts resume immediately with only
-the allowance remaining in their current window. A resumed attempt may still end
-in `failed`; that outcome is recorded and printed explicitly. As with `run`, a
-completed attempt that records task failure does not make the command itself fail.
-Rejected or conflicting invocations do return a non-zero exit status.
+Restoring a session is pure: it preserves configured allowance, remaining
+allowance, attempt usage, and halt state exactly as checkpointed. Agent-error
+resumes start a fresh configured window. Token-exhausted resumes are rejected
+until their durable absolute eligibility timestamp, and a stopped continuation
+returns its durable reason instead of minting another identical window.
+Interrupted attempts resume immediately with only the allowance remaining in
+their current window. The same not-before/stopped predicate is enforced again in
+the atomic claim, closing races between the snapshot and the write.
 
 ### Server and reset model
 
@@ -207,13 +210,12 @@ configuration and dependencies, then call `Run(ctx)`. It periodically rescans at
 capped interval so it notices work produced by other CLI processes without a hot
 loop. SQLite remains the sole coordinator.
 
-An executor that observes genuine token exhaustion writes `next_eligible_at` on
-the task. That absolute timestamp is authoritative even if another process uses a
-different reset interval. `serve` initializes older unscheduled exhausted tasks
-from the terminal run's `finished_at` and its configured interval. The global flag
-or `AGENT_INBOX_RESET_INTERVAL` gives `run`, `resume`, and `work` the same setting;
-the command-specific `serve --reset-interval` controls timestamps created by the
-server and legacy-state initialization.
+An executor that observes genuine token exhaustion always writes the provider's
+absolute reset timestamp. A typed continuation decision independently records
+whether automatic retry is scheduled or stopped. That timestamp is authoritative
+even if another process uses a different reset interval. `serve` initializes
+older unscheduled exhausted tasks from the terminal run's `finished_at` and its
+configured interval.
 
 Only genuine token exhaustion is retried automatically. Agent errors are terminal
 for automatic policy. Progress means a positive completed-step delta during the
@@ -232,11 +234,12 @@ returned as operational errors; they are not mislabeled as agent errors.
 ### Ownership, recovery, and reconciliation
 
 Every running run owns a cryptographically random token and a renewable three-
-second lease; executors renew once per second. Renewal, progress publication, and
-finalization are all guarded by run ID, owner token, and lease validity. If an
-owner loses its lease, its context is cancelled and stale writes are rejected.
-Task claims and run creation remain one SQLite compare-and-swap transaction, which
-also resolves races between `serve` and human commands.
+second lease; executors renew once per second and fence immediately before every
+step. Renewal, checkpoint publication, progress publication, and finalization are
+all guarded by run ID, owner token, and lease validity. If an owner loses its
+lease, it cannot execute another step. Task claims and run creation remain one
+SQLite compare-and-swap transaction, which also resolves races between `serve`
+and human commands.
 
 This follows the owner-token and fencing rationale described by the
 [Redis locking documentation](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
@@ -245,21 +248,24 @@ SQLite WAL permits concurrent readers but still serializes writers; see SQLite's
 [transaction](https://www.sqlite.org/lang_transaction.html) and
 [WAL](https://sqlite.org/wal.html) documentation.
 
-The session file records the current run identity, run-start step, completed step
-outputs, remaining allowance, and explicit halt reason. After a lease expires,
-`serve` reconciles that checkpoint before creating a replacement run:
+Each run stores an immutable-per-attempt session checkpoint in SQLite containing
+the run identity, run-start step, completed outputs, remaining allowance, and
+explicit halt reason. The latest fenced run selects the authoritative checkpoint;
+the compatibility file under `sessions/` is never used to resume a checkpointed
+run. After a lease expires, `serve` reconciles the SQLite checkpoint before
+creating a replacement run:
 
 - completed checkpoints become succeeded runs;
 - token exhaustion becomes scheduled or stopped according to completed-step delta;
 - agent errors become terminal errored runs;
 - interrupted or mid-step checkpoints become interrupted runs eligible immediately.
 
-Therefore every session step durably persisted before a process crash is
-attributed to exactly one historical run. This covers normal process termination
-and SIGKILL. It does not promise recovery from disk corruption, filesystem or
-hardware durability failures, or exactly-once side effects in a real external
-agent. A crash after the database run is inserted but before session binding is
-also recovered as an empty interrupted attempt with its intended allowance.
+Therefore a stale executor can neither rewind its successor's recovery source nor
+publish another step after takeover. A crash after the database run is inserted
+but before its first SQLite checkpoint is still recovered from the bootstrap
+session file as an empty interrupted attempt with its intended allowance. This
+does not promise exactly-once side effects for a future external agent; such an
+adapter would need an idempotency or transactional contract at its own seam.
 
 ### Observability
 
@@ -277,8 +283,7 @@ is alive; that would require a separate heartbeat guarantee.
   heartbeat or remote control endpoint.
 - Reset timing uses wall-clock timestamps. Large system-clock jumps can change
   when work becomes eligible.
-- Session JSON and SQLite are separate durability domains. Reconciliation closes
-  the process-crash gap, but disk corruption and power-loss durability depend on
-  the host filesystem and SQLite configuration.
+- Session JSON remains only a bootstrap/compatibility artifact; checkpointed
+  recovery is coordinated entirely through SQLite.
 - The simulated agent is deterministic — the same task title and description
   always produce the same plan and step costs.
