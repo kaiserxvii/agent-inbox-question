@@ -101,6 +101,8 @@ func seedPart1Failure(
 	delete(legacyState, "attempt_owner_token")
 	delete(legacyState, "attempt_start_step")
 	delete(legacyState, "attempt_halt_reason")
+	delete(legacyState, "attempt_window_origin")
+	legacyState["budget_model_version"] = 2
 	data, err = json.MarshalIndent(legacyState, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal legacy session: %v", err)

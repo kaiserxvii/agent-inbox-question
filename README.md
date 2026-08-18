@@ -197,13 +197,14 @@ outcome; the run status, exit reason, and task status are derived together by th
 domain model, so inconsistent combinations cannot be supplied.
 
 Restoring a session is pure: it preserves configured allowance, remaining
-allowance, attempt usage, and halt state exactly as checkpointed. Agent-error
-resumes start a fresh configured window. Token-exhausted resumes are rejected
-until their durable absolute eligibility timestamp, and a stopped continuation
-returns its durable reason instead of minting another identical window.
-Interrupted attempts resume immediately with only the allowance remaining in
-their current window. The same not-before/stopped predicate is enforced again in
-the atomic claim, closing races between the snapshot and the write.
+allowance, attempt usage, provider-window origin, and halt state exactly as
+checkpointed. Agent-error resumes start a fresh configured window.
+Token-exhausted resumes are rejected until their durable absolute eligibility
+timestamp, and a stopped continuation returns its durable reason instead of
+minting another identical window. Interrupted attempts resume immediately with
+only the allowance remaining in their current window and are marked as a
+continued window. The same not-before/stopped predicate is enforced again in the
+atomic claim, closing races between the snapshot and the write.
 
 ### Server and reset model
 
@@ -221,9 +222,9 @@ configured interval.
 
 Only genuine token exhaustion is retried automatically. Agent errors are terminal
 for automatic policy. Progress means a positive completed-step delta during the
-attempt. Because the plan is finite and every scheduled retry must advance at
-least one step, retries are naturally bounded by the remaining plan. A completely
-fresh window that advances zero steps is durably marked `stopped` with:
+attempt. A continued partial window that exhausts without progress waits for the
+next provider reset; only a fresh configured window that advances zero steps can
+prove the next step is oversized and be durably marked `stopped` with:
 
 ```
 auto-retry stopped: next step requires more than the configured window
@@ -254,14 +255,15 @@ SQLite WAL permits concurrent readers but still serializes writers; see SQLite's
 [WAL](https://sqlite.org/wal.html) documentation.
 
 Each run stores an immutable-per-attempt session checkpoint in SQLite containing
-the run identity, run-start step, completed outputs, remaining allowance, and
-explicit halt reason. The latest fenced run selects the authoritative checkpoint;
-the compatibility file under `sessions/` is never used to resume a checkpointed
-run. After a lease expires, `serve` reconciles the SQLite checkpoint before
-creating a replacement run:
+the run identity, run-start step, completed outputs, remaining allowance,
+provider-window origin, and explicit halt reason. The latest fenced run selects
+the authoritative checkpoint; the compatibility file under `sessions/` is never
+used to resume a checkpointed run. After a lease expires, `serve` reconciles the
+SQLite checkpoint before creating a replacement run:
 
 - completed checkpoints become succeeded runs;
-- token exhaustion becomes scheduled or stopped according to completed-step delta;
+- token exhaustion becomes scheduled or stopped according to progress and
+  window origin;
 - agent errors become terminal errored runs;
 - interrupted or mid-step checkpoints become interrupted runs eligible immediately.
 

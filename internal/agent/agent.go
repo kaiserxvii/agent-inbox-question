@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 // DefaultTokenBudget covers the worst-case default plan (8 steps at 400 tokens
@@ -74,32 +76,34 @@ type AttemptCheckpoint struct {
 	CompletedSteps  int
 	TokensUsed      int
 	TokensRemaining int
+	WindowOrigin    domain.ProviderWindowOrigin
 	HaltReason      HaltReason
 	Error           string
 	Output          string
 }
 
 type SessionState struct {
-	ID                    string     `json:"id"`
-	TaskTitle             string     `json:"task_title"`
-	TaskDesc              string     `json:"task_description"`
-	Feedback              []string   `json:"feedback,omitempty"`
-	Steps                 []Step     `json:"steps"`
-	BudgetModelVersion    int        `json:"budget_model_version"`
-	ConfiguredTokenBudget int        `json:"configured_token_budget"`
-	AttemptTokenAllowance int        `json:"attempt_token_allowance"`
-	TokensRemaining       int        `json:"tokens_remaining"`
-	TokensUsed            int        `json:"tokens_used"`
-	NextStep              int        `json:"next_step"`
-	Completed             bool       `json:"completed"`
-	ErroredAt             int        `json:"errored_at,omitempty"`
-	ErrorMessage          string     `json:"error_message,omitempty"`
-	BudgetHalted          bool       `json:"budget_halted"`
-	LegacyTokenBudget     int        `json:"token_budget,omitempty"`
-	AttemptRunID          int64      `json:"attempt_run_id,omitempty"`
-	AttemptOwnerToken     string     `json:"attempt_owner_token,omitempty"`
-	AttemptStartStep      int        `json:"attempt_start_step"`
-	AttemptHaltReason     HaltReason `json:"attempt_halt_reason,omitempty"`
+	ID                    string                      `json:"id"`
+	TaskTitle             string                      `json:"task_title"`
+	TaskDesc              string                      `json:"task_description"`
+	Feedback              []string                    `json:"feedback,omitempty"`
+	Steps                 []Step                      `json:"steps"`
+	BudgetModelVersion    int                         `json:"budget_model_version"`
+	ConfiguredTokenBudget int                         `json:"configured_token_budget"`
+	AttemptTokenAllowance int                         `json:"attempt_token_allowance"`
+	AttemptWindowOrigin   domain.ProviderWindowOrigin `json:"attempt_window_origin,omitempty"`
+	TokensRemaining       int                         `json:"tokens_remaining"`
+	TokensUsed            int                         `json:"tokens_used"`
+	NextStep              int                         `json:"next_step"`
+	Completed             bool                        `json:"completed"`
+	ErroredAt             int                         `json:"errored_at,omitempty"`
+	ErrorMessage          string                      `json:"error_message,omitempty"`
+	BudgetHalted          bool                        `json:"budget_halted"`
+	LegacyTokenBudget     int                         `json:"token_budget,omitempty"`
+	AttemptRunID          int64                       `json:"attempt_run_id,omitempty"`
+	AttemptOwnerToken     string                      `json:"attempt_owner_token,omitempty"`
+	AttemptStartStep      int                         `json:"attempt_start_step"`
+	AttemptHaltReason     HaltReason                  `json:"attempt_halt_reason,omitempty"`
 }
 
 type Session struct {
@@ -143,9 +147,10 @@ func Start(dataDir, taskTitle, taskDescription string, feedback []string, opts .
 		TaskDesc:              taskDescription,
 		Feedback:              feedback,
 		Steps:                 steps,
-		BudgetModelVersion:    2,
+		BudgetModelVersion:    3,
 		ConfiguredTokenBudget: budget,
 		AttemptTokenAllowance: budget,
+		AttemptWindowOrigin:   domain.ProviderWindowFresh,
 		TokensRemaining:       budget,
 		TokensUsed:            0,
 		NextStep:              0,
@@ -213,6 +218,10 @@ func decodeState(data []byte) (SessionState, error) {
 		}
 		state.LegacyTokenBudget = 0
 	}
+	if state.BudgetModelVersion < 3 {
+		state.BudgetModelVersion = 3
+		state.AttemptWindowOrigin = domain.ProviderWindowUnknown
+	}
 	return state, nil
 }
 
@@ -231,14 +240,25 @@ func (s *Session) Checkpoint() (string, error) {
 	return string(data), nil
 }
 
-// BeginAttempt applies an explicit provider-window allowance to the next
-// attempt. It only changes in-memory attempt state; Run persists that state as
-// work progresses.
-func (s *Session) BeginAttempt(allowance int) error {
+// BeginAttempt applies an explicit provider-window allowance and origin to the
+// next attempt. It only changes in-memory attempt state; Run persists that
+// state as work progresses.
+func (s *Session) BeginAttempt(
+	allowance int,
+	origin domain.ProviderWindowOrigin,
+) error {
 	if allowance < 0 {
 		return fmt.Errorf("attempt allowance must be non-negative: %d", allowance)
 	}
+	switch origin {
+	case domain.ProviderWindowUnknown,
+		domain.ProviderWindowFresh,
+		domain.ProviderWindowContinued:
+	default:
+		return fmt.Errorf("unknown provider window origin: %q", origin)
+	}
 	s.state.AttemptTokenAllowance = allowance
+	s.state.AttemptWindowOrigin = origin
 	s.state.TokensRemaining = allowance
 	s.state.TokensUsed = 0
 	s.state.BudgetHalted = false
@@ -247,6 +267,7 @@ func (s *Session) BeginAttempt(allowance int) error {
 
 func (s *Session) ContinueAttempt() {
 	s.state.AttemptTokenAllowance = s.state.TokensRemaining
+	s.state.AttemptWindowOrigin = domain.ProviderWindowContinued
 	s.state.TokensUsed = 0
 	s.state.BudgetHalted = false
 }
@@ -284,6 +305,7 @@ func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
 		CompletedSteps:  s.state.NextStep,
 		TokensUsed:      s.state.TokensUsed,
 		TokensRemaining: s.state.TokensRemaining,
+		WindowOrigin:    s.state.AttemptWindowOrigin,
 		HaltReason:      s.state.AttemptHaltReason,
 		Error:           s.state.ErrorMessage,
 		Output:          strings.Join(lines, "\n"),

@@ -120,12 +120,13 @@ func terminalizeCheckpoint(
 			checkpoint.HaltReason,
 		)
 	}
-	completion, err := domain.DecideAttemptCompletion(
-		outcome,
-		finishedAt,
-		resetInterval,
-		checkpoint.CompletedSteps > startStep,
-	)
+	completion, err := domain.DecideAttemptCompletion(domain.AttemptCompletionInput{
+		Outcome:       outcome,
+		FinishedAt:    finishedAt,
+		ResetInterval: resetInterval,
+		Progressed:    checkpoint.CompletedSteps > startStep,
+		WindowOrigin:  checkpoint.WindowOrigin,
+	})
 	if err != nil {
 		return attemptTerminalization{}, err
 	}
@@ -156,7 +157,10 @@ func RecoverExpired(
 				checkpoint.RunID,
 			)
 		}
-		if err := session.BeginAttempt(run.TokenBudget); err != nil {
+		if err := session.BeginAttempt(
+			run.TokenBudget,
+			domain.ProviderWindowUnknown,
+		); err != nil {
 			return fmt.Errorf("restore unbound run allowance: %w", err)
 		}
 		if err := session.BindAttempt(run.ID, run.OwnerToken); err != nil {
@@ -316,7 +320,10 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 		)
 	}
 	if candidate.ExitReason != domain.ExitInterrupted {
-		if err := session.BeginAttempt(allowance); err != nil {
+		if err := session.BeginAttempt(
+			allowance,
+			domain.ProviderWindowFresh,
+		); err != nil {
 			return AttemptResult{}, fmt.Errorf("begin resumed session attempt: %w", err)
 		}
 	}

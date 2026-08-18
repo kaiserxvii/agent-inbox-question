@@ -295,7 +295,7 @@ func TestBeginAttemptUsesExplicitAllowanceWithoutChangingConfiguredBudget(t *tes
 		t.Fatal("fixture used no tokens before exhaustion")
 	}
 
-	if err := session.BeginAttempt(250); err != nil {
+	if err := session.BeginAttempt(250, domain.ProviderWindowFresh); err != nil {
 		t.Fatalf("BeginAttempt: %v", err)
 	}
 	if session.ConfiguredBudget() != 400 {
@@ -309,6 +309,13 @@ func TestBeginAttemptUsesExplicitAllowanceWithoutChangingConfiguredBudget(t *tes
 	}
 	if session.TokensUsed() != 0 {
 		t.Errorf("attempt usage = %d, want 0", session.TokensUsed())
+	}
+	if got := session.AttemptCheckpoint().WindowOrigin; got != domain.ProviderWindowFresh {
+		t.Errorf("window origin = %q, want fresh", got)
+	}
+	session.ContinueAttempt()
+	if got := session.AttemptCheckpoint().WindowOrigin; got != domain.ProviderWindowContinued {
+		t.Errorf("continued window origin = %q, want continued", got)
 	}
 }
 

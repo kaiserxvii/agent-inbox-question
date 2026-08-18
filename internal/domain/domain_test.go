@@ -100,12 +100,12 @@ func TestAttemptOutcomeDeterminesEveryTerminalStatus(t *testing.T) {
 
 func TestTokenExhaustionStopsRetryWithoutDiscardingProviderReset(t *testing.T) {
 	finishedAt := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
-	completion, err := DecideAttemptCompletion(
-		AttemptTokenExhausted,
-		finishedAt,
-		time.Hour,
-		false,
-	)
+	completion, err := DecideAttemptCompletion(AttemptCompletionInput{
+		Outcome:       AttemptTokenExhausted,
+		FinishedAt:    finishedAt,
+		ResetInterval: time.Hour,
+		WindowOrigin:  ProviderWindowFresh,
+	})
 	if err != nil {
 		t.Fatalf("DecideAttemptCompletion: %v", err)
 	}
@@ -122,6 +122,37 @@ func TestTokenExhaustionStopsRetryWithoutDiscardingProviderReset(t *testing.T) {
 	}
 	if decision.Reason() != AutoRetryNoProgressReason {
 		t.Errorf("reason = %q, want %q", decision.Reason(), AutoRetryNoProgressReason)
+	}
+}
+
+func TestTokenExhaustionWithoutFreshWindowWaitsForReset(t *testing.T) {
+	for name, origin := range map[string]ProviderWindowOrigin{
+		"continued": ProviderWindowContinued,
+		"legacy":    ProviderWindowUnknown,
+	} {
+		t.Run(name, func(t *testing.T) {
+			finishedAt := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+			completion, err := DecideAttemptCompletion(AttemptCompletionInput{
+				Outcome:       AttemptTokenExhausted,
+				FinishedAt:    finishedAt,
+				ResetInterval: time.Hour,
+				WindowOrigin:  origin,
+			})
+			if err != nil {
+				t.Fatalf("DecideAttemptCompletion: %v", err)
+			}
+			decision := completion.Continuation()
+			if decision.Kind() != ContinuationScheduled {
+				t.Errorf("continuation = %q, want scheduled", decision.Kind())
+			}
+			wantReset := finishedAt.Add(time.Hour)
+			if reset := decision.EligibleAt(); reset == nil || !reset.Equal(wantReset) {
+				t.Errorf("provider reset = %v, want %s", reset, wantReset)
+			}
+			if decision.Reason() != "" {
+				t.Errorf("reason = %q, want empty", decision.Reason())
+			}
+		})
 	}
 }
 

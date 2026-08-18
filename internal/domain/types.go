@@ -53,6 +53,17 @@ const (
 	AttemptInterrupted    AttemptOutcome = "interrupted"
 )
 
+// ProviderWindowOrigin distinguishes a fresh provider reset allowance from a
+// continuation that inherited the remainder of an existing window. Unknown is
+// retained for checkpoints written before this fact was persisted.
+type ProviderWindowOrigin string
+
+const (
+	ProviderWindowUnknown   ProviderWindowOrigin = ""
+	ProviderWindowFresh     ProviderWindowOrigin = "fresh"
+	ProviderWindowContinued ProviderWindowOrigin = "continued"
+)
+
 type ContinuationKind string
 
 const (
@@ -163,18 +174,29 @@ func NewAttemptCompletion(
 	return AttemptCompletion{outcome: outcome, continuation: continuation}, nil
 }
 
-func DecideAttemptCompletion(
-	outcome AttemptOutcome,
-	finishedAt time.Time,
-	resetInterval time.Duration,
-	progressed bool,
-) (AttemptCompletion, error) {
+type AttemptCompletionInput struct {
+	Outcome       AttemptOutcome
+	FinishedAt    time.Time
+	ResetInterval time.Duration
+	Progressed    bool
+	WindowOrigin  ProviderWindowOrigin
+}
+
+func DecideAttemptCompletion(input AttemptCompletionInput) (AttemptCompletion, error) {
+	switch input.WindowOrigin {
+	case ProviderWindowUnknown, ProviderWindowFresh, ProviderWindowContinued:
+	default:
+		return AttemptCompletion{}, fmt.Errorf(
+			"unknown provider window origin: %q",
+			input.WindowOrigin,
+		)
+	}
 	decision := NoContinuation()
-	switch outcome {
+	switch input.Outcome {
 	case AttemptTokenExhausted:
-		if resetInterval > 0 {
-			resetAt := finishedAt.UTC().Add(resetInterval)
-			if progressed {
+		if input.ResetInterval > 0 {
+			resetAt := input.FinishedAt.UTC().Add(input.ResetInterval)
+			if input.Progressed || input.WindowOrigin != ProviderWindowFresh {
 				decision = ScheduledContinuation(resetAt)
 			} else {
 				var err error
@@ -185,12 +207,12 @@ func DecideAttemptCompletion(
 			}
 		}
 	case AttemptInterrupted:
-		decision = ScheduledContinuation(finishedAt)
+		decision = ScheduledContinuation(input.FinishedAt)
 	case AttemptCompleted, AttemptAgentError:
 	default:
-		return AttemptCompletion{}, fmt.Errorf("unknown attempt outcome: %q", outcome)
+		return AttemptCompletion{}, fmt.Errorf("unknown attempt outcome: %q", input.Outcome)
 	}
-	return NewAttemptCompletion(outcome, decision)
+	return NewAttemptCompletion(input.Outcome, decision)
 }
 
 func (c AttemptCompletion) Outcome() AttemptOutcome {

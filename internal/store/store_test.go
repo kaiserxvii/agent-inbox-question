@@ -34,12 +34,13 @@ func completionForTest(
 	progressed bool,
 ) domain.AttemptCompletion {
 	t.Helper()
-	completion, err := domain.DecideAttemptCompletion(
-		outcome,
-		finishedAt,
-		resetInterval,
-		progressed,
-	)
+	completion, err := domain.DecideAttemptCompletion(domain.AttemptCompletionInput{
+		Outcome:       outcome,
+		FinishedAt:    finishedAt,
+		ResetInterval: resetInterval,
+		Progressed:    progressed,
+		WindowOrigin:  domain.ProviderWindowFresh,
+	})
 	if err != nil {
 		t.Fatalf("DecideAttemptCompletion: %v", err)
 	}

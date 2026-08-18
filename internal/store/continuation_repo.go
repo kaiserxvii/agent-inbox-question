@@ -159,12 +159,13 @@ func (r *ContinuationRepo) InitializeUnscheduled(
 		return nil, fmt.Errorf("parse unscheduled run finish: %w", err)
 	}
 
-	completion, err := domain.DecideAttemptCompletion(
-		domain.AttemptTokenExhausted,
-		finished,
-		resetInterval,
-		tokensUsed > 0,
-	)
+	completion, err := domain.DecideAttemptCompletion(domain.AttemptCompletionInput{
+		Outcome:       domain.AttemptTokenExhausted,
+		FinishedAt:    finished,
+		ResetInterval: resetInterval,
+		Progressed:    tokensUsed > 0,
+		WindowOrigin:  domain.ProviderWindowFresh,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("decide unscheduled continuation: %w", err)
 	}
