@@ -42,7 +42,10 @@ func (r *TaskRepo) Create(title, description string) (*domain.Task, error) {
 
 func (r *TaskRepo) Get(id int64) (*domain.Task, error) {
 	row := r.db.sql.QueryRow(
-		"SELECT id, title, description, status, created_at, updated_at FROM tasks WHERE id = ?", id,
+		`SELECT id, title, description, status, created_at, updated_at,
+		        next_eligible_at, auto_retry_state, auto_retry_reason
+		 FROM tasks WHERE id = ?`,
+		id,
 	)
 	return scanTask(row)
 }
@@ -52,12 +55,15 @@ func (r *TaskRepo) List(statusFilter *domain.TaskStatus) ([]*domain.Task, error)
 	var err error
 	if statusFilter != nil {
 		rows, err = r.db.sql.Query(
-			"SELECT id, title, description, status, created_at, updated_at FROM tasks WHERE status = ? ORDER BY id",
+			`SELECT id, title, description, status, created_at, updated_at,
+			        next_eligible_at, auto_retry_state, auto_retry_reason
+			 FROM tasks WHERE status = ? ORDER BY id`,
 			*statusFilter,
 		)
 	} else {
 		rows, err = r.db.sql.Query(
-			`SELECT id, title, description, status, created_at, updated_at FROM tasks
+			`SELECT id, title, description, status, created_at, updated_at,
+			        next_eligible_at, auto_retry_state, auto_retry_reason FROM tasks
 			 ORDER BY CASE WHEN status = 'done' THEN 1 ELSE 0 END, id`,
 		)
 	}
@@ -120,7 +126,9 @@ func (r *TaskRepo) CountByStatus() (map[domain.TaskStatus]int, error) {
 
 func (r *TaskRepo) OldestByStatus(status domain.TaskStatus) (*domain.Task, error) {
 	row := r.db.sql.QueryRow(
-		"SELECT id, title, description, status, created_at, updated_at FROM tasks WHERE status = ? ORDER BY id LIMIT 1",
+		`SELECT id, title, description, status, created_at, updated_at,
+		        next_eligible_at, auto_retry_state, auto_retry_reason
+		 FROM tasks WHERE status = ? ORDER BY id LIMIT 1`,
 		status,
 	)
 	t, err := scanTask(row)
@@ -138,7 +146,18 @@ func scanTaskFrom(s scanner) (*domain.Task, error) {
 	var t domain.Task
 	var status string
 	var createdAt, updatedAt string
-	if err := s.Scan(&t.ID, &t.Title, &t.Description, &status, &createdAt, &updatedAt); err != nil {
+	var nextEligibleAt sql.NullString
+	if err := s.Scan(
+		&t.ID,
+		&t.Title,
+		&t.Description,
+		&status,
+		&createdAt,
+		&updatedAt,
+		&nextEligibleAt,
+		&t.AutoRetryState,
+		&t.AutoRetryReason,
+	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, domain.ErrNotFound
 		}
@@ -153,6 +172,13 @@ func scanTaskFrom(s scanner) (*domain.Task, error) {
 	t.UpdatedAt, err = time.Parse(time.RFC3339, updatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("parse updated_at: %w", err)
+	}
+	if nextEligibleAt.Valid {
+		next, parseErr := time.Parse(time.RFC3339Nano, nextEligibleAt.String)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse next_eligible_at: %w", parseErr)
+		}
+		t.NextEligibleAt = &next
 	}
 	return &t, nil
 }

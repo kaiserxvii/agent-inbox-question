@@ -1,13 +1,17 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
+
+const defaultAttemptLease = 30 * time.Second
 
 // AttemptRepo owns persistence operations that span an attempt, its task, and
 // any comment produced by the attempt.
@@ -18,23 +22,52 @@ type AttemptRepo struct {
 // ResumeCandidate is the task state and terminal predecessor observed by one
 // database statement.
 type ResumeCandidate struct {
-	TaskStatus domain.TaskStatus
-	RunID      int64
-	SessionID  string
-	ExitReason domain.ExitReason
+	TaskStatus      domain.TaskStatus
+	RunID           int64
+	SessionID       string
+	ExitReason      domain.ExitReason
+	NextEligibleAt  *time.Time
+	AutoRetryState  string
+	AutoRetryReason string
 }
 
 // FinishAttemptParams describes the attempt data stored alongside its single
 // terminal outcome. CommentAuthor and CommentBody must both be set or empty.
 type FinishAttemptParams struct {
-	RunID         int64
-	TaskID        int64
-	Outcome       domain.AttemptOutcome
-	Output        string
-	TokensUsed    int
-	Error         string
-	CommentAuthor string
-	CommentBody   string
+	RunID           int64
+	TaskID          int64
+	OwnerToken      string
+	Outcome         domain.AttemptOutcome
+	Output          string
+	TokensUsed      int
+	Error           string
+	CommentAuthor   string
+	CommentBody     string
+	FinishedAt      time.Time
+	LeaseCheckedAt  time.Time
+	NextEligibleAt  *time.Time
+	AutoRetryState  string
+	AutoRetryReason string
+	RecoverExpired  bool
+}
+
+type StartAttemptParams struct {
+	TaskID         int64
+	ExpectedStatus domain.TaskStatus
+	ExpectedRunID  int64
+	SessionID      string
+	TokenBudget    int
+	StartStep      int
+	StartedAt      time.Time
+	LeaseDuration  time.Duration
+}
+
+type AttemptProgress struct {
+	RunID      int64
+	OwnerToken string
+	ObservedAt time.Time
+	Output     string
+	TokensUsed int
 }
 
 func NewAttemptRepo(db *DB) *AttemptRepo {
@@ -48,7 +81,10 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 		`SELECT tasks.status,
 		        COALESCE(candidate.id, 0),
 		        COALESCE(candidate.session_id, ''),
-		        COALESCE(candidate.exit_reason, '')
+		        COALESCE(candidate.exit_reason, ''),
+		        tasks.next_eligible_at,
+		        tasks.auto_retry_state,
+		        tasks.auto_retry_reason
 		 FROM tasks
 		 LEFT JOIN runs AS candidate ON candidate.id = (
 		   SELECT id
@@ -63,12 +99,16 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 	)
 	var status string
 	var exitReason string
+	var nextEligibleAt sql.NullString
 	candidate := &ResumeCandidate{}
 	if err := row.Scan(
 		&status,
 		&candidate.RunID,
 		&candidate.SessionID,
 		&exitReason,
+		&nextEligibleAt,
+		&candidate.AutoRetryState,
+		&candidate.AutoRetryReason,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrNotFound
@@ -77,18 +117,64 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 	}
 	candidate.TaskStatus = domain.TaskStatus(status)
 	candidate.ExitReason = domain.ExitReason(exitReason)
+	if nextEligibleAt.Valid {
+		next, err := time.Parse(time.RFC3339Nano, nextEligibleAt.String)
+		if err != nil {
+			return nil, fmt.Errorf("parse resume eligibility: %w", err)
+		}
+		candidate.NextEligibleAt = &next
+	}
 	return candidate, nil
 }
 
-func (r *AttemptRepo) UpdateProgress(id int64, output string, tokensUsed int) error {
-	_, err := r.db.sql.Exec(
-		"UPDATE runs SET output = ?, tokens_used = ? WHERE id = ?",
-		output,
-		tokensUsed,
-		id,
+func (r *AttemptRepo) UpdateProgress(progress AttemptProgress) error {
+	result, err := r.db.sql.Exec(
+		`UPDATE runs SET output = ?, tokens_used = ?
+		 WHERE id = ? AND status = ? AND owner_token = ? AND lease_expires_at > ?`,
+		progress.Output,
+		progress.TokensUsed,
+		progress.RunID,
+		domain.RunRunning,
+		progress.OwnerToken,
+		progress.ObservedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("update run progress: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count updated run progress: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("%w: run %d cannot publish progress", domain.ErrLeaseLost, progress.RunID)
+	}
+	return nil
+}
+
+func (r *AttemptRepo) RenewLease(
+	id int64,
+	ownerToken string,
+	now time.Time,
+	leaseDuration time.Duration,
+) error {
+	result, err := r.db.sql.Exec(
+		`UPDATE runs SET lease_expires_at = ?
+		 WHERE id = ? AND status = ? AND owner_token = ? AND lease_expires_at > ?`,
+		now.UTC().Add(leaseDuration).Format(time.RFC3339Nano),
+		id,
+		domain.RunRunning,
+		ownerToken,
+		now.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("renew attempt lease: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count renewed attempt lease: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("%w: run %d cannot renew lease", domain.ErrLeaseLost, id)
 	}
 	return nil
 }
@@ -116,11 +202,28 @@ func (r *AttemptRepo) FinishAttempt(params FinishAttemptParams) error {
 		return cause
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	finishedAt := params.FinishedAt
+	if finishedAt.IsZero() {
+		finishedAt = time.Now().UTC()
+	}
+	now := finishedAt.Format(time.RFC3339Nano)
+	leaseCheckedAt := params.LeaseCheckedAt
+	if leaseCheckedAt.IsZero() {
+		leaseCheckedAt = time.Now().UTC()
+	}
+	var nextEligibleAt any
+	if params.NextEligibleAt != nil {
+		nextEligibleAt = params.NextEligibleAt.UTC().Format(time.RFC3339Nano)
+	}
 	runResult, err := tx.Exec(
 		`UPDATE runs
 		 SET status = ?, exit_reason = ?, output = ?, tokens_used = ?, error = ?, finished_at = ?
-		 WHERE id = ? AND task_id = ? AND status = ?`,
+		 WHERE id = ? AND task_id = ? AND status = ?
+		   AND (
+		     (? = 0 AND owner_token = ? AND lease_expires_at > ?)
+		     OR
+		     (? = 1 AND lease_expires_at <= ?)
+		   )`,
 		state.RunStatus,
 		state.ExitReason,
 		params.Output,
@@ -130,6 +233,11 @@ func (r *AttemptRepo) FinishAttempt(params FinishAttemptParams) error {
 		params.RunID,
 		params.TaskID,
 		domain.RunRunning,
+		boolInt(params.RecoverExpired),
+		params.OwnerToken,
+		leaseCheckedAt.Format(time.RFC3339Nano),
+		boolInt(params.RecoverExpired),
+		leaseCheckedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return rollback(fmt.Errorf("finish run: %w", err))
@@ -139,14 +247,19 @@ func (r *AttemptRepo) FinishAttempt(params FinishAttemptParams) error {
 		return rollback(fmt.Errorf("count finished runs: %w", err))
 	}
 	if rows != 1 {
-		return rollback(fmt.Errorf("%w: run %d is no longer running", domain.ErrConflict, params.RunID))
+		return rollback(fmt.Errorf("%w: run %d cannot be finalized", domain.ErrLeaseLost, params.RunID))
 	}
 
 	taskResult, err := tx.Exec(
-		`UPDATE tasks SET status = ?, updated_at = ?
+		`UPDATE tasks
+		 SET status = ?, updated_at = ?, next_eligible_at = ?,
+		     auto_retry_state = ?, auto_retry_reason = ?
 		 WHERE id = ? AND status = ?`,
 		state.TaskStatus,
 		now,
+		nextEligibleAt,
+		params.AutoRetryState,
+		params.AutoRetryReason,
 		params.TaskID,
 		domain.TaskInProgress,
 	)
@@ -180,6 +293,21 @@ func (r *AttemptRepo) FinishAttempt(params FinishAttemptParams) error {
 	return nil
 }
 
+func (r *AttemptRepo) NextExpired(now time.Time) (*domain.Run, error) {
+	row := r.db.sql.QueryRow(
+		`SELECT id, task_id, session_id, status, exit_reason, output,
+		        tokens_used, token_budget, error, started_at, finished_at,
+		        owner_token, lease_expires_at, start_step
+		 FROM runs
+		 WHERE status = ? AND lease_expires_at <= ?
+		 ORDER BY lease_expires_at, id
+		 LIMIT 1`,
+		domain.RunRunning,
+		now.UTC().Format(time.RFC3339Nano),
+	)
+	return scanRunFrom(row)
+}
+
 // StartAttempt atomically claims a task and records the running attempt that
 // owns the claim. An expectedRunID of zero requires no prior attempts;
 // otherwise it must still be the task's latest run.
@@ -190,8 +318,28 @@ func (r *AttemptRepo) StartAttempt(
 	sessionID string,
 	tokenBudget int,
 ) (*domain.Run, error) {
-	if err := domain.Transition(expectedStatus, domain.TaskInProgress); err != nil {
+	now := time.Now().UTC()
+	return r.StartOwnedAttempt(StartAttemptParams{
+		TaskID:         taskID,
+		ExpectedStatus: expectedStatus,
+		ExpectedRunID:  expectedRunID,
+		SessionID:      sessionID,
+		TokenBudget:    tokenBudget,
+		StartedAt:      now,
+		LeaseDuration:  defaultAttemptLease,
+	})
+}
+
+func (r *AttemptRepo) StartOwnedAttempt(params StartAttemptParams) (*domain.Run, error) {
+	if err := domain.Transition(params.ExpectedStatus, domain.TaskInProgress); err != nil {
 		return nil, err
+	}
+	if params.LeaseDuration <= 0 {
+		return nil, errors.New("attempt lease duration must be positive")
+	}
+	ownerToken, err := generateOwnerToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate attempt owner token: %w", err)
 	}
 
 	tx, err := r.db.sql.Begin()
@@ -205,10 +353,16 @@ func (r *AttemptRepo) StartAttempt(
 		return nil, cause
 	}
 
-	now := time.Now().UTC()
-	nowStr := now.Format(time.RFC3339)
+	now := params.StartedAt.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	nowStr := now.Format(time.RFC3339Nano)
+	leaseExpiresAt := now.Add(params.LeaseDuration)
 	result, err := tx.Exec(
-		`UPDATE tasks SET status = ?, updated_at = ?
+		`UPDATE tasks
+		 SET status = ?, updated_at = ?, next_eligible_at = NULL,
+		     auto_retry_state = '', auto_retry_reason = ''
 		 WHERE id = ? AND status = ?
 		   AND (
 		     (? = 0 AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id = ?))
@@ -217,13 +371,13 @@ func (r *AttemptRepo) StartAttempt(
 		   )`,
 		domain.TaskInProgress,
 		nowStr,
-		taskID,
-		expectedStatus,
-		expectedRunID,
-		taskID,
-		expectedRunID,
-		expectedRunID,
-		taskID,
+		params.TaskID,
+		params.ExpectedStatus,
+		params.ExpectedRunID,
+		params.TaskID,
+		params.ExpectedRunID,
+		params.ExpectedRunID,
+		params.TaskID,
 	)
 	if err != nil {
 		return rollback(fmt.Errorf("claim task: %w", err))
@@ -238,7 +392,7 @@ func (r *AttemptRepo) StartAttempt(
 		if err := tx.QueryRow(
 			`SELECT status, COALESCE((SELECT MAX(id) FROM runs WHERE task_id = tasks.id), 0)
 			 FROM tasks WHERE id = ?`,
-			taskID,
+			params.TaskID,
 		).Scan(&observed, &observedRunID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return rollback(domain.ErrNotFound)
@@ -246,22 +400,27 @@ func (r *AttemptRepo) StartAttempt(
 			return rollback(fmt.Errorf("read conflicting task status: %w", err))
 		}
 		return rollback(&domain.TaskStatusConflict{
-			TaskID:        taskID,
-			Expected:      expectedStatus,
+			TaskID:        params.TaskID,
+			Expected:      params.ExpectedStatus,
 			Observed:      observed,
-			ExpectedRunID: expectedRunID,
+			ExpectedRunID: params.ExpectedRunID,
 			ObservedRunID: observedRunID,
 		})
 	}
 
 	result, err = tx.Exec(
-		`INSERT INTO runs (task_id, session_id, status, exit_reason, output, tokens_used, token_budget, error, started_at)
-		 VALUES (?, ?, ?, '', '', 0, ?, '', ?)`,
-		taskID,
-		sessionID,
+		`INSERT INTO runs (
+		   task_id, session_id, status, exit_reason, output, tokens_used,
+		   token_budget, error, started_at, owner_token, lease_expires_at, start_step
+		 ) VALUES (?, ?, ?, '', '', 0, ?, '', ?, ?, ?, ?)`,
+		params.TaskID,
+		params.SessionID,
 		domain.RunRunning,
-		tokenBudget,
+		params.TokenBudget,
 		nowStr,
+		ownerToken,
+		leaseExpiresAt.Format(time.RFC3339Nano),
+		params.StartStep,
 	)
 	if err != nil {
 		return rollback(fmt.Errorf("insert run: %w", err))
@@ -275,11 +434,29 @@ func (r *AttemptRepo) StartAttempt(
 		return rollback(fmt.Errorf("commit start attempt transaction: %w", err))
 	}
 	return &domain.Run{
-		ID:          runID,
-		TaskID:      taskID,
-		SessionID:   sessionID,
-		Status:      domain.RunRunning,
-		TokenBudget: tokenBudget,
-		StartedAt:   now,
+		ID:             runID,
+		TaskID:         params.TaskID,
+		SessionID:      params.SessionID,
+		Status:         domain.RunRunning,
+		TokenBudget:    params.TokenBudget,
+		StartedAt:      now,
+		OwnerToken:     ownerToken,
+		LeaseExpiresAt: &leaseExpiresAt,
+		StartStep:      params.StartStep,
 	}, nil
+}
+
+func generateOwnerToken() (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

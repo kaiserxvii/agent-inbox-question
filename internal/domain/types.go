@@ -31,6 +31,7 @@ const (
 	RunSucceeded      RunStatus = "succeeded"
 	RunErrored        RunStatus = "errored"
 	RunTokenExhausted RunStatus = "token_exhausted"
+	RunInterrupted    RunStatus = "interrupted"
 )
 
 type ExitReason string
@@ -40,6 +41,7 @@ const (
 	ExitCompleted            ExitReason = "completed"
 	ExitAgentError           ExitReason = "agent_error"
 	ExitTokenBudgetExhausted ExitReason = "token_budget_exhausted"
+	ExitInterrupted          ExitReason = "interrupted"
 )
 
 type AttemptOutcome string
@@ -48,6 +50,7 @@ const (
 	AttemptCompleted      AttemptOutcome = "completed"
 	AttemptAgentError     AttemptOutcome = "agent_error"
 	AttemptTokenExhausted AttemptOutcome = "token_exhausted"
+	AttemptInterrupted    AttemptOutcome = "interrupted"
 )
 
 type TerminalAttemptState struct {
@@ -76,32 +79,44 @@ func (o AttemptOutcome) TerminalState() (TerminalAttemptState, error) {
 			ExitReason: ExitTokenBudgetExhausted,
 			TaskStatus: TaskFailed,
 		}, nil
+	case AttemptInterrupted:
+		return TerminalAttemptState{
+			RunStatus:  RunInterrupted,
+			ExitReason: ExitInterrupted,
+			TaskStatus: TaskFailed,
+		}, nil
 	default:
 		return TerminalAttemptState{}, fmt.Errorf("unknown attempt outcome: %q", o)
 	}
 }
 
 type Task struct {
-	ID          int64
-	Title       string
-	Description string
-	Status      TaskStatus
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID              int64
+	Title           string
+	Description     string
+	Status          TaskStatus
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	NextEligibleAt  *time.Time
+	AutoRetryState  string
+	AutoRetryReason string
 }
 
 type Run struct {
-	ID          int64
-	TaskID      int64
-	SessionID   string
-	Status      RunStatus
-	ExitReason  ExitReason
-	Output      string
-	TokensUsed  int
-	TokenBudget int
-	Error       string
-	StartedAt   time.Time
-	FinishedAt  *time.Time
+	ID             int64
+	TaskID         int64
+	SessionID      string
+	Status         RunStatus
+	ExitReason     ExitReason
+	Output         string
+	TokensUsed     int
+	TokenBudget    int
+	Error          string
+	StartedAt      time.Time
+	FinishedAt     *time.Time
+	OwnerToken     string
+	LeaseExpiresAt *time.Time
+	StartStep      int
 }
 
 type Comment struct {
@@ -116,6 +131,7 @@ var (
 	ErrInvalidTransition = errors.New("invalid status transition")
 	ErrConflict          = errors.New("concurrent modification conflict")
 	ErrNotFound          = errors.New("not found")
+	ErrLeaseLost         = errors.New("attempt lease lost")
 )
 
 // TaskStatusConflict reports the task status observed when a compare-and-swap

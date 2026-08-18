@@ -19,6 +19,7 @@ type App struct {
 	Runs          *store.RunRepo
 	Attempts      *store.AttemptRepo
 	Comments      *store.CommentRepo
+	Continuations *store.ContinuationRepo
 	Stdout        io.Writer
 	Stderr        io.Writer
 	RunnerOptions runner.Options
@@ -30,14 +31,16 @@ func NewApp(dataDir string) (*App, error) {
 		return nil, err
 	}
 	return &App{
-		DataDir:  dataDir,
-		DB:       db,
-		Tasks:    store.NewTaskRepo(db),
-		Runs:     store.NewRunRepo(db),
-		Attempts: store.NewAttemptRepo(db),
-		Comments: store.NewCommentRepo(db),
-		Stdout:   os.Stdout,
-		Stderr:   os.Stderr,
+		DataDir:       dataDir,
+		DB:            db,
+		Tasks:         store.NewTaskRepo(db),
+		Runs:          store.NewRunRepo(db),
+		Attempts:      store.NewAttemptRepo(db),
+		Comments:      store.NewCommentRepo(db),
+		Continuations: store.NewContinuationRepo(db),
+		Stdout:        os.Stdout,
+		Stderr:        os.Stderr,
+		RunnerOptions: runner.Options{ResetInterval: runner.DefaultResetInterval},
 	}, nil
 }
 

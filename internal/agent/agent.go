@@ -27,6 +27,7 @@ const (
 	Completed
 	Errored
 	TokenBudgetExhausted
+	Interrupted
 )
 
 type Outcome struct {
@@ -48,23 +49,49 @@ type Step struct {
 	Output    string `json:"output,omitempty"`
 }
 
+type HaltReason string
+
+const (
+	HaltRunning        HaltReason = "running"
+	HaltCompleted      HaltReason = "completed"
+	HaltAgentError     HaltReason = "agent_error"
+	HaltTokenExhausted HaltReason = "token_exhausted"
+	HaltInterrupted    HaltReason = "interrupted"
+)
+
+type AttemptCheckpoint struct {
+	RunID           int64
+	OwnerToken      string
+	StartStep       int
+	CompletedSteps  int
+	TokensUsed      int
+	TokensRemaining int
+	HaltReason      HaltReason
+	Error           string
+	Output          string
+}
+
 type SessionState struct {
-	ID                    string   `json:"id"`
-	TaskTitle             string   `json:"task_title"`
-	TaskDesc              string   `json:"task_description"`
-	Feedback              []string `json:"feedback,omitempty"`
-	Steps                 []Step   `json:"steps"`
-	BudgetModelVersion    int      `json:"budget_model_version"`
-	ConfiguredTokenBudget int      `json:"configured_token_budget"`
-	AttemptTokenAllowance int      `json:"attempt_token_allowance"`
-	TokensRemaining       int      `json:"tokens_remaining"`
-	TokensUsed            int      `json:"tokens_used"`
-	NextStep              int      `json:"next_step"`
-	Completed             bool     `json:"completed"`
-	ErroredAt             int      `json:"errored_at,omitempty"`
-	ErrorMessage          string   `json:"error_message,omitempty"`
-	BudgetHalted          bool     `json:"budget_halted"`
-	LegacyTokenBudget     int      `json:"token_budget,omitempty"`
+	ID                    string     `json:"id"`
+	TaskTitle             string     `json:"task_title"`
+	TaskDesc              string     `json:"task_description"`
+	Feedback              []string   `json:"feedback,omitempty"`
+	Steps                 []Step     `json:"steps"`
+	BudgetModelVersion    int        `json:"budget_model_version"`
+	ConfiguredTokenBudget int        `json:"configured_token_budget"`
+	AttemptTokenAllowance int        `json:"attempt_token_allowance"`
+	TokensRemaining       int        `json:"tokens_remaining"`
+	TokensUsed            int        `json:"tokens_used"`
+	NextStep              int        `json:"next_step"`
+	Completed             bool       `json:"completed"`
+	ErroredAt             int        `json:"errored_at,omitempty"`
+	ErrorMessage          string     `json:"error_message,omitempty"`
+	BudgetHalted          bool       `json:"budget_halted"`
+	LegacyTokenBudget     int        `json:"token_budget,omitempty"`
+	AttemptRunID          int64      `json:"attempt_run_id,omitempty"`
+	AttemptOwnerToken     string     `json:"attempt_owner_token,omitempty"`
+	AttemptStartStep      int        `json:"attempt_start_step"`
+	AttemptHaltReason     HaltReason `json:"attempt_halt_reason,omitempty"`
 }
 
 type Session struct {
@@ -164,6 +191,7 @@ func (s *Session) ConfiguredBudget() int { return s.state.ConfiguredTokenBudget 
 func (s *Session) AttemptAllowance() int { return s.state.AttemptTokenAllowance }
 func (s *Session) RemainingBudget() int  { return s.state.TokensRemaining }
 func (s *Session) TokensUsed() int       { return s.state.TokensUsed }
+func (s *Session) CompletedSteps() int   { return s.state.NextStep }
 
 // BeginAttempt applies an explicit provider-window allowance to the next
 // attempt. It only changes in-memory attempt state; Run persists that state as
@@ -179,6 +207,51 @@ func (s *Session) BeginAttempt(allowance int) error {
 	return nil
 }
 
+func (s *Session) ContinueAttempt() {
+	s.state.AttemptTokenAllowance = s.state.TokensRemaining
+	s.state.TokensUsed = 0
+	s.state.BudgetHalted = false
+}
+
+func (s *Session) BindAttempt(runID int64, ownerToken string) error {
+	s.state.AttemptRunID = runID
+	s.state.AttemptOwnerToken = ownerToken
+	s.state.AttemptStartStep = s.state.NextStep
+	s.state.AttemptHaltReason = HaltRunning
+	s.state.ErrorMessage = ""
+	if err := s.persist(); err != nil {
+		return fmt.Errorf("persist attempt binding: %w", err)
+	}
+	return nil
+}
+
+func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
+	lines := make([]string, 0, s.state.NextStep-s.state.AttemptStartStep+1)
+	for index := s.state.AttemptStartStep; index < s.state.NextStep; index++ {
+		if s.state.Steps[index].Output != "" {
+			lines = append(lines, s.state.Steps[index].Output)
+		}
+	}
+	if s.state.AttemptHaltReason == HaltCompleted {
+		lines = append(lines, fmt.Sprintf(
+			"completed all %d steps for: %s",
+			len(s.state.Steps),
+			s.state.TaskTitle,
+		))
+	}
+	return AttemptCheckpoint{
+		RunID:           s.state.AttemptRunID,
+		OwnerToken:      s.state.AttemptOwnerToken,
+		StartStep:       s.state.AttemptStartStep,
+		CompletedSteps:  s.state.NextStep,
+		TokensUsed:      s.state.TokensUsed,
+		TokensRemaining: s.state.TokensRemaining,
+		HaltReason:      s.state.AttemptHaltReason,
+		Error:           s.state.ErrorMessage,
+		Output:          strings.Join(lines, "\n"),
+	}
+}
+
 func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error) {
 	failAt := -1
 	if s.state.ErroredAt > 0 {
@@ -188,10 +261,11 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 	for s.state.NextStep < len(s.state.Steps) {
 		select {
 		case <-ctx.Done():
+			s.state.AttemptHaltReason = HaltInterrupted
 			if err := s.persist(); err != nil {
 				return Outcome{}, fmt.Errorf("persist canceled session: %w", err)
 			}
-			return Outcome{Kind: Errored, Err: ctx.Err()}, nil
+			return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 		default:
 		}
 
@@ -199,6 +273,7 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 		stepIdx := s.state.NextStep + 1
 
 		if failAt > 0 && stepIdx == failAt {
+			s.state.AttemptHaltReason = HaltAgentError
 			s.state.ErrorMessage = fmt.Sprintf("agent error at step %d: %s", stepIdx, step.Name)
 			s.state.ErroredAt = 0
 			if err := s.persist(); err != nil {
@@ -209,6 +284,7 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 
 		if step.TokenCost > s.state.TokensRemaining {
 			s.state.BudgetHalted = true
+			s.state.AttemptHaltReason = HaltTokenExhausted
 			if err := s.persist(); err != nil {
 				return Outcome{}, fmt.Errorf("persist token exhaustion: %w", err)
 			}
@@ -221,10 +297,11 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				s.state.AttemptHaltReason = HaltInterrupted
 				if err := s.persist(); err != nil {
 					return Outcome{}, fmt.Errorf("persist canceled session: %w", err)
 				}
-				return Outcome{Kind: Errored, Err: ctx.Err()}, nil
+				return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 			case <-timer.C:
 			}
 		}
@@ -250,6 +327,7 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 	}
 
 	s.state.Completed = true
+	s.state.AttemptHaltReason = HaltCompleted
 	if err := s.persist(); err != nil {
 		return Outcome{}, fmt.Errorf("persist completed session: %w", err)
 	}

@@ -333,8 +333,8 @@ func TestContextCancellation(t *testing.T) {
 
 	s, _ := Start(dir, "t", "[steps:5] [budget:5000]", nil, WithNoDelay())
 	outcome, _ := s.Run(ctx, nil)
-	if outcome.Kind != Errored {
-		t.Errorf("outcome = %d, want Errored on cancelled context", outcome.Kind)
+	if outcome.Kind != Interrupted {
+		t.Errorf("outcome = %d, want Interrupted on cancelled context", outcome.Kind)
 	}
 }
 

@@ -5,10 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/villagelabsco/agent-inbox-question/internal/agent"
 	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 	"github.com/villagelabsco/agent-inbox-question/internal/store"
 )
@@ -271,6 +275,9 @@ func TestResumeRejectsTasksThatAreNotFailed(t *testing.T) {
 			if err == nil {
 				t.Fatal("Resume returned nil, want status error")
 			}
+			if !errors.Is(err, domain.ErrConflict) {
+				t.Errorf("Resume error = %v, want ErrConflict", err)
+			}
 			want := fmt.Sprintf("status is %q", status)
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("Resume error = %q, want it to contain %q", err, want)
@@ -376,10 +383,79 @@ func TestResumeReportsAnotherTokenExhaustion(t *testing.T) {
 	}
 }
 
+func TestResumeRejectsTokenExhaustedTaskBeforeReset(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	deps.Options = Options{
+		NoDelay:       true,
+		Now:           func() time.Time { return now },
+		ResetInterval: time.Hour,
+	}
+	task := createTask(t, tasks, "waiting task", "[steps:2] [budget:400]")
+	if err := Execute(context.Background(), deps, task.ID); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	_, err := Resume(context.Background(), deps, task.ID)
+	if err == nil {
+		t.Fatal("Resume returned nil before reset")
+	}
+	if !strings.Contains(err.Error(), "until 2026-08-17T13:00:00Z") {
+		t.Errorf("Resume error omits eligibility timestamp: %v", err)
+	}
+	if !strings.Contains(err.Error(), "1h0m0s remaining") {
+		t.Errorf("Resume error omits remaining duration: %v", err)
+	}
+	if count, err := runs.CountByTask(task.ID); err != nil {
+		t.Fatalf("CountByTask: %v", err)
+	} else if count != 1 {
+		t.Errorf("runs = %d, want 1", count)
+	}
+}
+
 type closeOnWrite struct {
 	close   func() error
 	closeAt int
 	writes  int
+}
+
+type cancelOnWrite struct {
+	cancel context.CancelFunc
+}
+
+type breakSessionPersistence struct {
+	dataDir string
+	done    bool
+}
+
+func (w *breakSessionPersistence) Write(p []byte) (int, error) {
+	if w.done {
+		return len(p), nil
+	}
+	w.done = true
+	entries, err := os.ReadDir(filepath.Join(w.dataDir, "sessions"))
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(w.dataDir, "sessions", entry.Name())
+		if err := os.Remove(path); err != nil {
+			return 0, err
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+	return 0, errors.New("session file not found")
+}
+
+func (w cancelOnWrite) Write(p []byte) (int, error) {
+	w.cancel()
+	return len(p), nil
 }
 
 func (w *closeOnWrite) Write(p []byte) (int, error) {
@@ -422,6 +498,136 @@ func TestExecuteReportsAttemptFinalizationFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "finish attempt") {
 		t.Errorf("Execute error = %q, want attempt finalization context", err)
+	}
+}
+
+func TestSessionPersistenceFailureRemainsOperational(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	deps.Output = &breakSessionPersistence{dataDir: deps.DataDir}
+	deps.Options.NoDelay = true
+	task := createTask(t, tasks, "persistence failure", "[steps:3] [budget:5000]")
+
+	err := Execute(context.Background(), deps, task.ID)
+	if err == nil {
+		t.Fatal("Execute returned nil, want persistence error")
+	}
+	if !strings.Contains(err.Error(), "run agent session") {
+		t.Errorf("Execute error = %q, want operational run context", err)
+	}
+	current := getTask(t, tasks, task.ID)
+	if current.Status != domain.TaskInProgress {
+		t.Errorf("task status = %q, want in_progress for recovery", current.Status)
+	}
+	history := listRuns(t, runs, task.ID)
+	if len(history) != 1 || history[0].Status != domain.RunRunning {
+		t.Errorf("runs = %#v, want one running recovery candidate", history)
+	}
+}
+
+func TestRecoveryHandlesCrashBeforeSessionBinding(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	task := createTask(t, tasks, "pre-bind crash", "[steps:2] [budget:5000]")
+	session, err := agent.Start(
+		deps.DataDir,
+		task.Title,
+		task.Description,
+		nil,
+		agent.WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start session: %v", err)
+	}
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	run, err := deps.Attempts.StartOwnedAttempt(store.StartAttemptParams{
+		TaskID:         task.ID,
+		ExpectedStatus: domain.TaskTodo,
+		SessionID:      session.ID(),
+		TokenBudget:    session.AttemptAllowance(),
+		StartedAt:      now.Add(-2 * time.Minute),
+		LeaseDuration:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("StartOwnedAttempt: %v", err)
+	}
+
+	if err := RecoverExpired(deps, run, time.Hour, now); err != nil {
+		t.Fatalf("RecoverExpired: %v", err)
+	}
+	deps.Options = Options{
+		NoDelay:       true,
+		Now:           func() time.Time { return now },
+		ResetInterval: time.Hour,
+	}
+	result, err := Resume(context.Background(), deps, task.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if result.Outcome != domain.AttemptCompleted {
+		t.Errorf("resume outcome = %q, want completed", result.Outcome)
+	}
+
+	history := listRuns(t, runs, task.ID)
+	if len(history) != 2 {
+		t.Fatalf("runs = %d, want 2", len(history))
+	}
+	if history[0].Status != domain.RunInterrupted || history[0].Output != "" {
+		t.Errorf(
+			"expired run = (status %q, output %q), want interrupted with no output",
+			history[0].Status,
+			history[0].Output,
+		)
+	}
+	if history[1].TokenBudget != run.TokenBudget {
+		t.Errorf("replacement allowance = %d, want %d", history[1].TokenBudget, run.TokenBudget)
+	}
+}
+
+func TestGracefulInterruptionResumesImmediatelyWithRemainingAllowance(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	task := createTask(t, tasks, "interrupted task", "[steps:3] [budget:5000]")
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	deps.Output = cancelOnWrite{cancel: cancel}
+	deps.Options = Options{
+		NoDelay:       true,
+		Now:           func() time.Time { return now },
+		ResetInterval: time.Hour,
+	}
+
+	if err := Execute(ctx, deps, task.ID); err != nil {
+		t.Fatalf("Execute interrupted task: %v", err)
+	}
+
+	first := listRuns(t, runs, task.ID)
+	if len(first) != 1 {
+		t.Fatalf("runs after interruption = %d, want 1", len(first))
+	}
+	if first[0].Status != domain.RunInterrupted || first[0].ExitReason != domain.ExitInterrupted {
+		t.Errorf(
+			"interrupted run = (%q, %q), want (interrupted, interrupted)",
+			first[0].Status,
+			first[0].ExitReason,
+		)
+	}
+	remaining := first[0].TokenBudget - first[0].TokensUsed
+	if remaining <= 0 || remaining >= first[0].TokenBudget {
+		t.Fatalf("remaining allowance = %d, want positive partial window", remaining)
+	}
+
+	deps.Output = nil
+	resumeResult, err := Resume(context.Background(), deps, task.ID)
+	if err != nil {
+		t.Fatalf("Resume interrupted task: %v", err)
+	}
+	if resumeResult.Outcome != domain.AttemptCompleted {
+		t.Fatalf("resume outcome = %q, want completed", resumeResult.Outcome)
+	}
+	after := listRuns(t, runs, task.ID)
+	if len(after) != 2 {
+		t.Fatalf("runs after resume = %d, want 2", len(after))
+	}
+	if after[1].TokenBudget != remaining {
+		t.Errorf("resumed allowance = %d, want remaining %d", after[1].TokenBudget, remaining)
 	}
 }
 
@@ -507,5 +713,27 @@ func TestExecuteConflict(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrConflict) {
 		t.Errorf("error = %v, want ErrConflict", err)
+	}
+}
+
+func TestExecuteRenewsLeaseWhileAgentRuns(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	deps.Options = Options{
+		LeaseDuration:      100 * time.Millisecond,
+		LeaseRenewInterval: 20 * time.Millisecond,
+	}
+	task := createTask(t, tasks, "renewed attempt", "[steps:1] [budget:5000]")
+
+	if err := Execute(context.Background(), deps, task.ID); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	completed := getTask(t, tasks, task.ID)
+	if completed.Status != domain.TaskDone {
+		t.Errorf("task status = %q, want done", completed.Status)
+	}
+	runList := listRuns(t, runs, task.ID)
+	if len(runList) != 1 || runList[0].Status != domain.RunSucceeded {
+		t.Errorf("runs = %#v, want one succeeded run", runList)
 	}
 }

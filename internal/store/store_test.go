@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
@@ -168,13 +169,20 @@ func TestAttemptLifecycle(t *testing.T) {
 		t.Errorf("budget = %d, want 1200", run.TokenBudget)
 	}
 
-	if err := attempts.UpdateProgress(run.ID, "partial output", 300); err != nil {
+	if err := attempts.UpdateProgress(AttemptProgress{
+		RunID:      run.ID,
+		OwnerToken: run.OwnerToken,
+		ObservedAt: time.Now().UTC(),
+		Output:     "partial output",
+		TokensUsed: 300,
+	}); err != nil {
 		t.Fatalf("UpdateProgress: %v", err)
 	}
 
 	if err := attempts.FinishAttempt(FinishAttemptParams{
 		RunID:      run.ID,
 		TaskID:     task.ID,
+		OwnerToken: run.OwnerToken,
 		Outcome:    domain.AttemptCompleted,
 		Output:     "final output",
 		TokensUsed: 800,
@@ -272,7 +280,7 @@ func TestStartAttemptRejectsAResumeOfAnAlreadyConsumedRun(t *testing.T) {
 		t.Fatalf("first StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: first.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Outcome: domain.AttemptTokenExhausted,
 	}); err != nil {
 		t.Fatalf("first FinishAttempt: %v", err)
 	}
@@ -281,7 +289,7 @@ func TestStartAttemptRejectsAResumeOfAnAlreadyConsumedRun(t *testing.T) {
 		t.Fatalf("second StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: second.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+		RunID: second.ID, TaskID: task.ID, OwnerToken: second.OwnerToken, Outcome: domain.AttemptTokenExhausted,
 	}); err != nil {
 		t.Fatalf("second FinishAttempt: %v", err)
 	}
@@ -321,7 +329,7 @@ func TestResumeCandidateSnapshotRejectsAConcurrentRefailure(t *testing.T) {
 		t.Fatalf("first StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: first.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Outcome: domain.AttemptTokenExhausted,
 	}); err != nil {
 		t.Fatalf("first FinishAttempt: %v", err)
 	}
@@ -380,7 +388,7 @@ func TestResumeCandidateSnapshotRejectsAConcurrentRefailure(t *testing.T) {
 		t.Fatalf("concurrent StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: second.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+		RunID: second.ID, TaskID: task.ID, OwnerToken: second.OwnerToken, Outcome: domain.AttemptTokenExhausted,
 	}); err != nil {
 		t.Fatalf("concurrent FinishAttempt: %v", err)
 	}
@@ -427,6 +435,7 @@ func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
 	err = attempts.FinishAttempt(FinishAttemptParams{
 		RunID:         run.ID,
 		TaskID:        task.ID + 1,
+		OwnerToken:    run.OwnerToken,
 		Outcome:       domain.AttemptCompleted,
 		Output:        "completed output",
 		TokensUsed:    500,
@@ -476,9 +485,10 @@ func TestFinishAttemptRejectsUnknownOutcome(t *testing.T) {
 	}
 
 	err = attempts.FinishAttempt(FinishAttemptParams{
-		RunID:   run.ID,
-		TaskID:  task.ID,
-		Outcome: domain.AttemptOutcome("unknown"),
+		RunID:      run.ID,
+		TaskID:     task.ID,
+		OwnerToken: run.OwnerToken,
+		Outcome:    domain.AttemptOutcome("unknown"),
 	})
 	if err == nil {
 		t.Fatal("FinishAttempt returned nil for unknown outcome")
@@ -581,7 +591,7 @@ func TestRunCountByTask(t *testing.T) {
 		t.Fatalf("first StartAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID: first.ID, TaskID: task.ID, Outcome: domain.AttemptAgentError,
+		RunID: first.ID, TaskID: task.ID, OwnerToken: first.OwnerToken, Outcome: domain.AttemptAgentError,
 	}); err != nil {
 		t.Fatalf("first FinishAttempt: %v", err)
 	}
@@ -626,6 +636,82 @@ func TestLatestRunByTaskReturnsNewestAttempt(t *testing.T) {
 	}
 	if latest.ID != second.ID {
 		t.Errorf("latest run ID = %d, want %d", latest.ID, second.ID)
+	}
+}
+
+func TestStaleAttemptOwnerCannotPublishProgress(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("fenced task", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	run, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1000)
+	if err != nil {
+		t.Fatalf("StartAttempt: %v", err)
+	}
+
+	err = attempts.UpdateProgress(AttemptProgress{
+		RunID:      run.ID,
+		OwnerToken: "stale-owner-token",
+		ObservedAt: time.Now().UTC(),
+		Output:     "should not be stored",
+		TokensUsed: 100,
+	})
+	if !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("UpdateProgress error = %v, want ErrLeaseLost", err)
+	}
+
+	stored, err := runs.LatestByTask(task.ID)
+	if err != nil {
+		t.Fatalf("LatestByTask: %v", err)
+	}
+	if stored.Output != "" || stored.TokensUsed != 0 {
+		t.Errorf("stale progress was stored: output=%q tokens=%d", stored.Output, stored.TokensUsed)
+	}
+}
+
+func TestStaleAttemptOwnerCannotFinalizeRun(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("fenced finalization", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	run, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1000)
+	if err != nil {
+		t.Fatalf("StartAttempt: %v", err)
+	}
+	err = attempts.FinishAttempt(FinishAttemptParams{
+		RunID:      run.ID,
+		TaskID:     task.ID,
+		OwnerToken: "stale-owner-token",
+		Outcome:    domain.AttemptCompleted,
+		FinishedAt: time.Now().UTC(),
+	})
+	if !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("FinishAttempt error = %v, want ErrLeaseLost", err)
+	}
+
+	stored, err := runs.LatestByTask(task.ID)
+	if err != nil {
+		t.Fatalf("LatestByTask: %v", err)
+	}
+	if stored.Status != domain.RunRunning {
+		t.Errorf("run status = %q, want running", stored.Status)
+	}
+	storedTask, err := tasks.Get(task.ID)
+	if err != nil {
+		t.Fatalf("Get task: %v", err)
+	}
+	if storedTask.Status != domain.TaskInProgress {
+		t.Errorf("task status = %q, want in_progress", storedTask.Status)
 	}
 }
 

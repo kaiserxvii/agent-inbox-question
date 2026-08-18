@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/villagelabsco/agent-inbox-question/internal/runner"
 )
@@ -72,6 +73,50 @@ func TestRunStatusWritesCountsToConfiguredStdout(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "total") {
 		t.Errorf("configured stdout does not contain status counts:\n%s", stdout.String())
+	}
+}
+
+func TestRunStatusShowsNextAutomaticContinuation(t *testing.T) {
+	app, err := NewApp(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewApp: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	task, err := app.Tasks.Create("scheduled task", "[steps:2] [budget:400]")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	if err := runner.Execute(context.Background(), runner.Deps{
+		DataDir:  app.DataDir,
+		Tasks:    app.Tasks,
+		Attempts: app.Attempts,
+		Options: runner.Options{
+			NoDelay:       true,
+			Now:           func() time.Time { return now },
+			ResetInterval: time.Hour,
+		},
+	}, task.ID); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	var output bytes.Buffer
+	app.Stdout = &output
+	if err := app.RunStatus(); err != nil {
+		t.Fatalf("RunStatus: %v", err)
+	}
+	shown := output.String()
+	want := "Next automatic continuation: task #1 at 2026-08-17T13:00:00Z"
+	if !strings.Contains(shown, want) {
+		t.Errorf("status does not contain %q:\n%s", want, shown)
+	}
+	if !strings.Contains(shown, "Durable state does not prove a server process is alive") {
+		t.Errorf("status omits server-liveness limitation:\n%s", shown)
 	}
 }
 
