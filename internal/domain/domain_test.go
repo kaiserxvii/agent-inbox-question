@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestTransition(t *testing.T) {
@@ -12,6 +13,7 @@ func TestTransition(t *testing.T) {
 		{TaskTodo, TaskInProgress},
 		{TaskInProgress, TaskDone},
 		{TaskInProgress, TaskFailed},
+		{TaskFailed, TaskInProgress},
 	}
 	for _, tc := range allowed {
 		if err := Transition(tc.from, tc.to); err != nil {
@@ -32,7 +34,6 @@ func TestTransition(t *testing.T) {
 		{TaskDone, TaskInProgress},
 		{TaskDone, TaskFailed},
 		{TaskFailed, TaskTodo},
-		{TaskFailed, TaskInProgress},
 		{TaskFailed, TaskDone},
 		{TaskFailed, TaskFailed},
 	}
@@ -60,5 +61,114 @@ func TestParseTaskStatus(t *testing.T) {
 	}
 	if _, err := ParseTaskStatus("bogus"); err == nil {
 		t.Error("ParseTaskStatus(bogus) should fail")
+	}
+}
+
+func TestAttemptOutcomeDeterminesEveryTerminalStatus(t *testing.T) {
+	tests := []struct {
+		outcome    AttemptOutcome
+		runStatus  RunStatus
+		exitReason ExitReason
+		taskStatus TaskStatus
+	}{
+		{AttemptCompleted, RunSucceeded, ExitCompleted, TaskDone},
+		{AttemptAgentError, RunErrored, ExitAgentError, TaskFailed},
+		{AttemptTokenExhausted, RunTokenExhausted, ExitTokenBudgetExhausted, TaskFailed},
+	}
+
+	for _, test := range tests {
+		state, err := test.outcome.TerminalState()
+		if err != nil {
+			t.Fatalf("TerminalState(%q): %v", test.outcome, err)
+		}
+		if state.RunStatus != test.runStatus ||
+			state.ExitReason != test.exitReason ||
+			state.TaskStatus != test.taskStatus {
+			t.Errorf(
+				"TerminalState(%q) = (%q, %q, %q), want (%q, %q, %q)",
+				test.outcome,
+				state.RunStatus,
+				state.ExitReason,
+				state.TaskStatus,
+				test.runStatus,
+				test.exitReason,
+				test.taskStatus,
+			)
+		}
+	}
+}
+
+func TestTokenExhaustionStopsRetryWithoutDiscardingProviderReset(t *testing.T) {
+	finishedAt := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	completion, err := DecideAttemptCompletion(AttemptCompletionInput{
+		Outcome:       AttemptTokenExhausted,
+		FinishedAt:    finishedAt,
+		ResetInterval: time.Hour,
+		WindowOrigin:  ProviderWindowFresh,
+	})
+	if err != nil {
+		t.Fatalf("DecideAttemptCompletion: %v", err)
+	}
+	if completion.Outcome() != AttemptTokenExhausted {
+		t.Errorf("outcome = %q, want token exhausted", completion.Outcome())
+	}
+	decision := completion.Continuation()
+	if decision.Kind() != ContinuationStopped {
+		t.Errorf("continuation = %q, want stopped", decision.Kind())
+	}
+	wantReset := finishedAt.Add(time.Hour)
+	if reset := decision.EligibleAt(); reset == nil || !reset.Equal(wantReset) {
+		t.Errorf("provider reset = %v, want %s", reset, wantReset)
+	}
+	if decision.Reason() != AutoRetryNoProgressReason {
+		t.Errorf("reason = %q, want %q", decision.Reason(), AutoRetryNoProgressReason)
+	}
+}
+
+func TestTokenExhaustionWithoutFreshWindowWaitsForReset(t *testing.T) {
+	for name, origin := range map[string]ProviderWindowOrigin{
+		"continued": ProviderWindowContinued,
+		"legacy":    ProviderWindowUnknown,
+	} {
+		t.Run(name, func(t *testing.T) {
+			finishedAt := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+			completion, err := DecideAttemptCompletion(AttemptCompletionInput{
+				Outcome:       AttemptTokenExhausted,
+				FinishedAt:    finishedAt,
+				ResetInterval: time.Hour,
+				WindowOrigin:  origin,
+			})
+			if err != nil {
+				t.Fatalf("DecideAttemptCompletion: %v", err)
+			}
+			decision := completion.Continuation()
+			if decision.Kind() != ContinuationScheduled {
+				t.Errorf("continuation = %q, want scheduled", decision.Kind())
+			}
+			wantReset := finishedAt.Add(time.Hour)
+			if reset := decision.EligibleAt(); reset == nil || !reset.Equal(wantReset) {
+				t.Errorf("provider reset = %v, want %s", reset, wantReset)
+			}
+			if decision.Reason() != "" {
+				t.Errorf("reason = %q, want empty", decision.Reason())
+			}
+		})
+	}
+}
+
+func TestAttemptCompletionRejectsUnknownOutcome(t *testing.T) {
+	if _, err := NewAttemptCompletion(AttemptOutcome("unknown"), NoContinuation()); err == nil {
+		t.Fatal("NewAttemptCompletion accepted unknown outcome")
+	}
+}
+
+func TestAttemptCompletionRejectsIncompatibleContinuation(t *testing.T) {
+	resetAt := time.Date(2026, time.August, 17, 13, 0, 0, 0, time.UTC)
+	stopped, err := StoppedContinuation(resetAt, AutoRetryNoProgressReason)
+	if err != nil {
+		t.Fatalf("StoppedContinuation: %v", err)
+	}
+	if _, err := NewAttemptCompletion(AttemptCompleted, stopped); err == nil {
+		t.Fatal("NewAttemptCompletion accepted stopped retry for completed attempt")
 	}
 }

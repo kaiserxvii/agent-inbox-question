@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 // DefaultTokenBudget covers the worst-case default plan (8 steps at 400 tokens
@@ -22,9 +25,11 @@ const DefaultTokenBudget = 3500
 type OutcomeKind int
 
 const (
-	Completed OutcomeKind = iota
+	OutcomeUnknown OutcomeKind = iota
+	Completed
 	Errored
 	TokenBudgetExhausted
+	Interrupted
 )
 
 type Outcome struct {
@@ -39,6 +44,14 @@ type Event struct {
 	TokensUsed int
 }
 
+// StateCommit is the complete durable form of a session transition. Event is
+// present only when the transition also produced user-visible output.
+type StateCommit struct {
+	Checkpoint string
+	TokensUsed int
+	Event      *Event
+}
+
 type Step struct {
 	Name      string `json:"name"`
 	TokenCost int    `json:"token_cost"`
@@ -46,25 +59,60 @@ type Step struct {
 	Output    string `json:"output,omitempty"`
 }
 
+type HaltReason string
+
+const (
+	HaltRunning        HaltReason = "running"
+	HaltCompleted      HaltReason = "completed"
+	HaltAgentError     HaltReason = "agent_error"
+	HaltTokenExhausted HaltReason = "token_exhausted"
+	HaltInterrupted    HaltReason = "interrupted"
+)
+
+type AttemptCheckpoint struct {
+	RunID           int64
+	OwnerToken      string
+	StartStep       int
+	CompletedSteps  int
+	TokensUsed      int
+	TokensRemaining int
+	WindowOrigin    domain.ProviderWindowOrigin
+	HaltedAt        *time.Time
+	HaltReason      HaltReason
+	Error           string
+	Output          string
+}
+
 type SessionState struct {
-	ID           string   `json:"id"`
-	TaskTitle    string   `json:"task_title"`
-	TaskDesc     string   `json:"task_description"`
-	Feedback     []string `json:"feedback,omitempty"`
-	Steps        []Step   `json:"steps"`
-	TokenBudget  int      `json:"token_budget"`
-	TokensUsed   int      `json:"tokens_used"`
-	NextStep     int      `json:"next_step"`
-	Completed    bool     `json:"completed"`
-	ErroredAt    int      `json:"errored_at,omitempty"`
-	ErrorMessage string   `json:"error_message,omitempty"`
-	BudgetHalted bool     `json:"budget_halted"`
+	ID                    string                      `json:"id"`
+	TaskTitle             string                      `json:"task_title"`
+	TaskDesc              string                      `json:"task_description"`
+	Feedback              []string                    `json:"feedback,omitempty"`
+	Steps                 []Step                      `json:"steps"`
+	BudgetModelVersion    int                         `json:"budget_model_version"`
+	ConfiguredTokenBudget int                         `json:"configured_token_budget"`
+	AttemptTokenAllowance int                         `json:"attempt_token_allowance"`
+	AttemptWindowOrigin   domain.ProviderWindowOrigin `json:"attempt_window_origin,omitempty"`
+	TokensRemaining       int                         `json:"tokens_remaining"`
+	TokensUsed            int                         `json:"tokens_used"`
+	NextStep              int                         `json:"next_step"`
+	Completed             bool                        `json:"completed"`
+	ErroredAt             int                         `json:"errored_at,omitempty"`
+	ErrorMessage          string                      `json:"error_message,omitempty"`
+	BudgetHalted          bool                        `json:"budget_halted"`
+	LegacyTokenBudget     int                         `json:"token_budget,omitempty"`
+	AttemptRunID          int64                       `json:"attempt_run_id,omitempty"`
+	AttemptOwnerToken     string                      `json:"attempt_owner_token,omitempty"`
+	AttemptStartStep      int                         `json:"attempt_start_step"`
+	AttemptHaltReason     HaltReason                  `json:"attempt_halt_reason,omitempty"`
+	AttemptHaltedAt       *time.Time                  `json:"attempt_halted_at,omitempty"`
 }
 
 type Session struct {
 	state   SessionState
 	dataDir string
 	noDelay bool
+	now     func() time.Time
 }
 
 type Option func(*Session)
@@ -72,6 +120,14 @@ type Option func(*Session)
 func WithNoDelay() Option {
 	return func(s *Session) {
 		s.noDelay = true
+	}
+}
+
+func WithNow(now func() time.Time) Option {
+	return func(s *Session) {
+		if now != nil {
+			s.now = now
+		}
 	}
 }
 
@@ -97,24 +153,25 @@ func Start(dataDir, taskTitle, taskDescription string, feedback []string, opts .
 	steps := buildSteps(h, stepCount, feedback)
 
 	state := SessionState{
-		ID:          id,
-		TaskTitle:   taskTitle,
-		TaskDesc:    taskDescription,
-		Feedback:    feedback,
-		Steps:       steps,
-		TokenBudget: budget,
-		TokensUsed:  0,
-		NextStep:    0,
+		ID:                    id,
+		TaskTitle:             taskTitle,
+		TaskDesc:              taskDescription,
+		Feedback:              feedback,
+		Steps:                 steps,
+		BudgetModelVersion:    3,
+		ConfiguredTokenBudget: budget,
+		AttemptTokenAllowance: budget,
+		AttemptWindowOrigin:   domain.ProviderWindowFresh,
+		TokensRemaining:       budget,
+		TokensUsed:            0,
+		NextStep:              0,
 	}
 
-	failAt := -1
-	if v, ok := directives["fail-at"]; ok {
-		failAt = v
+	if failAt, ok := directives["fail-at"]; ok {
 		state.ErroredAt = failAt
 	}
-	_ = failAt
 
-	s := &Session{state: state, dataDir: dataDir}
+	s := &Session{state: state, dataDir: dataDir, now: time.Now}
 	for _, o := range opts {
 		o(s)
 	}
@@ -131,26 +188,183 @@ func Load(dataDir, sessionID string, opts ...Option) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load session %s: %w", sessionID, err)
 	}
-	var state SessionState
-	if err := json.Unmarshal(data, &state); err != nil {
+	state, err := decodeState(data)
+	if err != nil {
 		return nil, fmt.Errorf("parse session %s: %w", sessionID, err)
 	}
-	state.TokenBudget = state.TokenBudget - state.TokensUsed + DefaultTokenBudget
-	state.TokensUsed = 0
-	state.BudgetHalted = false
-
-	s := &Session{state: state, dataDir: dataDir}
+	s := &Session{state: state, dataDir: dataDir, now: time.Now}
 	for _, o := range opts {
 		o(s)
 	}
 	return s, nil
 }
 
-func (s *Session) ID() string      { return s.state.ID }
-func (s *Session) Budget() int     { return s.state.TokenBudget }
-func (s *Session) TokensUsed() int { return s.state.TokensUsed }
+// Restore reconstructs a session from an authoritative checkpoint rather than
+// the mutable compatibility file in sessions/.
+func Restore(dataDir, checkpoint string, opts ...Option) (*Session, error) {
+	state, err := decodeState([]byte(checkpoint))
+	if err != nil {
+		return nil, fmt.Errorf("parse session checkpoint: %w", err)
+	}
+	s := &Session{state: state, dataDir: dataDir, now: time.Now}
+	for _, o := range opts {
+		o(s)
+	}
+	return s, nil
+}
+
+func decodeState(data []byte) (SessionState, error) {
+	var state SessionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return SessionState{}, err
+	}
+	if state.BudgetModelVersion < 2 {
+		state.BudgetModelVersion = 2
+		if state.ConfiguredTokenBudget == 0 {
+			state.ConfiguredTokenBudget = state.LegacyTokenBudget
+		}
+		state.AttemptTokenAllowance = state.LegacyTokenBudget
+		if state.TokensRemaining == 0 && state.LegacyTokenBudget > 0 {
+			state.TokensRemaining = max(0, state.LegacyTokenBudget-state.TokensUsed)
+		}
+		state.LegacyTokenBudget = 0
+	}
+	if state.BudgetModelVersion < 3 {
+		state.BudgetModelVersion = 3
+		state.AttemptWindowOrigin = domain.ProviderWindowUnknown
+	}
+	return state, nil
+}
+
+func (s *Session) ID() string            { return s.state.ID }
+func (s *Session) ConfiguredBudget() int { return s.state.ConfiguredTokenBudget }
+func (s *Session) AttemptAllowance() int { return s.state.AttemptTokenAllowance }
+func (s *Session) RemainingBudget() int  { return s.state.TokensRemaining }
+func (s *Session) TokensUsed() int       { return s.state.TokensUsed }
+func (s *Session) CompletedSteps() int   { return s.state.NextStep }
+
+func (s *Session) Checkpoint() (string, error) {
+	data, err := json.Marshal(s.state)
+	if err != nil {
+		return "", fmt.Errorf("marshal session checkpoint: %w", err)
+	}
+	return string(data), nil
+}
+
+// BeginAttempt applies an explicit provider-window allowance and origin to the
+// next attempt. It only changes in-memory attempt state; Run persists that
+// state as work progresses.
+func (s *Session) BeginAttempt(
+	allowance int,
+	origin domain.ProviderWindowOrigin,
+) error {
+	if allowance < 0 {
+		return fmt.Errorf("attempt allowance must be non-negative: %d", allowance)
+	}
+	switch origin {
+	case domain.ProviderWindowUnknown,
+		domain.ProviderWindowFresh,
+		domain.ProviderWindowContinued:
+	default:
+		return fmt.Errorf("unknown provider window origin: %q", origin)
+	}
+	s.state.AttemptTokenAllowance = allowance
+	s.state.AttemptWindowOrigin = origin
+	s.state.TokensRemaining = allowance
+	s.state.TokensUsed = 0
+	s.state.BudgetHalted = false
+	return nil
+}
+
+func (s *Session) ContinueAttempt() {
+	s.state.AttemptTokenAllowance = s.state.TokensRemaining
+	s.state.AttemptWindowOrigin = domain.ProviderWindowContinued
+	s.state.TokensUsed = 0
+	s.state.BudgetHalted = false
+}
+
+func (s *Session) BindAttempt(runID int64, ownerToken string) error {
+	s.state.AttemptRunID = runID
+	s.state.AttemptOwnerToken = ownerToken
+	s.state.AttemptStartStep = s.state.NextStep
+	s.state.AttemptHaltReason = HaltRunning
+	s.state.AttemptHaltedAt = nil
+	s.state.ErrorMessage = ""
+	if err := s.persist(); err != nil {
+		return fmt.Errorf("persist attempt binding: %w", err)
+	}
+	return nil
+}
+
+func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
+	lines := make([]string, 0, s.state.NextStep-s.state.AttemptStartStep+1)
+	for index := s.state.AttemptStartStep; index < s.state.NextStep; index++ {
+		if s.state.Steps[index].Output != "" {
+			lines = append(lines, s.state.Steps[index].Output)
+		}
+	}
+	if s.state.AttemptHaltReason == HaltCompleted {
+		lines = append(lines, fmt.Sprintf(
+			"completed all %d steps for: %s",
+			len(s.state.Steps),
+			s.state.TaskTitle,
+		))
+	}
+	var haltedAt *time.Time
+	if s.state.AttemptHaltedAt != nil {
+		value := *s.state.AttemptHaltedAt
+		haltedAt = &value
+	}
+	return AttemptCheckpoint{
+		RunID:           s.state.AttemptRunID,
+		OwnerToken:      s.state.AttemptOwnerToken,
+		StartStep:       s.state.AttemptStartStep,
+		CompletedSteps:  s.state.NextStep,
+		TokensUsed:      s.state.TokensUsed,
+		TokensRemaining: s.state.TokensRemaining,
+		WindowOrigin:    s.state.AttemptWindowOrigin,
+		HaltedAt:        haltedAt,
+		HaltReason:      s.state.AttemptHaltReason,
+		Error:           s.state.ErrorMessage,
+		Output:          strings.Join(lines, "\n"),
+	}
+}
 
 func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error) {
+	var commit func(StateCommit) error
+	if onEvent != nil {
+		commit = func(change StateCommit) error {
+			if change.Event != nil {
+				onEvent(*change.Event)
+			}
+			return nil
+		}
+	}
+	return s.run(ctx, nil, commit)
+}
+
+// RunFenced verifies ownership before each step and commits the simulated side
+// effect and every terminal state through commit. A rejected commit rolls the
+// in-memory transition back and never writes it to the compatibility file.
+func (s *Session) RunFenced(
+	ctx context.Context,
+	fence func() error,
+	commit func(StateCommit) error,
+) (Outcome, error) {
+	if fence == nil {
+		return Outcome{}, errors.New("step fence is required")
+	}
+	if commit == nil {
+		return Outcome{}, errors.New("fenced state sink is required")
+	}
+	return s.run(ctx, fence, commit)
+}
+
+func (s *Session) run(
+	ctx context.Context,
+	fence func() error,
+	commit func(StateCommit) error,
+) (Outcome, error) {
 	failAt := -1
 	if s.state.ErroredAt > 0 {
 		failAt = s.state.ErroredAt
@@ -159,23 +373,41 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 	for s.state.NextStep < len(s.state.Steps) {
 		select {
 		case <-ctx.Done():
-			s.persist()
-			return Outcome{Kind: Errored, Err: ctx.Err()}, nil
+			previous := cloneState(s.state)
+			s.state.AttemptHaltReason = HaltInterrupted
+			if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "canceled session"); err != nil {
+				return Outcome{}, err
+			}
+			return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 		default:
+		}
+		if fence != nil {
+			if err := fence(); err != nil {
+				return Outcome{}, err
+			}
 		}
 
 		step := &s.state.Steps[s.state.NextStep]
 		stepIdx := s.state.NextStep + 1
 
 		if failAt > 0 && stepIdx == failAt {
+			previous := cloneState(s.state)
+			s.state.AttemptHaltReason = HaltAgentError
 			s.state.ErrorMessage = fmt.Sprintf("agent error at step %d: %s", stepIdx, step.Name)
-			s.persist()
-			return Outcome{Kind: Errored, Err: fmt.Errorf("%s", s.state.ErrorMessage)}, nil
+			s.state.ErroredAt = 0
+			if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "agent error"); err != nil {
+				return Outcome{}, err
+			}
+			return Outcome{Kind: Errored, Err: errors.New(s.state.ErrorMessage)}, nil
 		}
 
-		if s.state.TokensUsed+step.TokenCost > s.state.TokenBudget {
+		if step.TokenCost > s.state.TokensRemaining {
+			previous := cloneState(s.state)
 			s.state.BudgetHalted = true
-			s.persist()
+			s.state.AttemptHaltReason = HaltTokenExhausted
+			if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "token exhaustion"); err != nil {
+				return Outcome{}, err
+			}
 			return Outcome{Kind: TokenBudgetExhausted}, nil
 		}
 
@@ -185,54 +417,164 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				s.persist()
-				return Outcome{Kind: Errored, Err: ctx.Err()}, nil
+				previous := cloneState(s.state)
+				s.state.AttemptHaltReason = HaltInterrupted
+				if err := s.commitState(previous, fence != nil, commit, StateCommit{}, "canceled session"); err != nil {
+					return Outcome{}, err
+				}
+				return Outcome{Kind: Interrupted, Err: ctx.Err()}, nil
 			case <-timer.C:
+			}
+			if fence != nil {
+				if err := fence(); err != nil {
+					return Outcome{}, err
+				}
 			}
 		}
 
+		previous := cloneState(s.state)
 		step.Output = fmt.Sprintf("[step %d/%d] %s: processed", stepIdx, len(s.state.Steps), step.Name)
 		step.Done = true
 		s.state.TokensUsed += step.TokenCost
+		s.state.TokensRemaining -= step.TokenCost
 		s.state.NextStep++
 
-		if onEvent != nil {
-			onEvent(Event{
-				Step:       stepIdx,
-				StepName:   step.Name,
-				Output:     step.Output,
-				TokensUsed: s.state.TokensUsed,
-			})
+		event := Event{
+			Step:       stepIdx,
+			StepName:   step.Name,
+			Output:     step.Output,
+			TokensUsed: s.state.TokensUsed,
 		}
-
-		if err := s.persist(); err != nil {
-			return Outcome{}, fmt.Errorf("persist session: %w", err)
+		if err := s.commitState(
+			previous,
+			fence != nil,
+			commit,
+			StateCommit{Event: &event},
+			"session",
+		); err != nil {
+			return Outcome{}, err
 		}
 	}
 
+	previous := cloneState(s.state)
 	s.state.Completed = true
-	s.persist()
-
+	s.state.AttemptHaltReason = HaltCompleted
 	summary := fmt.Sprintf("completed all %d steps for: %s", len(s.state.Steps), s.state.TaskTitle)
-	if onEvent != nil {
-		onEvent(Event{
-			Step:       len(s.state.Steps),
-			StepName:   "summary",
-			Output:     summary,
-			TokensUsed: s.state.TokensUsed,
-		})
+	event := Event{
+		Step:       len(s.state.Steps),
+		StepName:   "summary",
+		Output:     summary,
+		TokensUsed: s.state.TokensUsed,
+	}
+	if err := s.commitState(
+		previous,
+		fence != nil,
+		commit,
+		StateCommit{Event: &event},
+		"completed session",
+	); err != nil {
+		return Outcome{}, err
 	}
 
 	return Outcome{Kind: Completed}, nil
 }
 
+func (s *Session) commitState(
+	previous SessionState,
+	fenced bool,
+	commit func(StateCommit) error,
+	change StateCommit,
+	description string,
+) error {
+	terminal := s.state.AttemptHaltReason != "" &&
+		s.state.AttemptHaltReason != HaltRunning
+	if terminal && s.state.AttemptHaltedAt == nil {
+		haltedAt := s.now().UTC()
+		s.state.AttemptHaltedAt = &haltedAt
+	}
+	if commit != nil {
+		checkpoint, err := s.Checkpoint()
+		if err != nil {
+			return fmt.Errorf("encode %s checkpoint: %w", description, err)
+		}
+		change.Checkpoint = checkpoint
+		change.TokensUsed = s.TokensUsed()
+	}
+	if fenced {
+		if err := commit(change); err != nil {
+			s.state = previous
+			return err
+		}
+	}
+	if err := s.persist(); err != nil {
+		return fmt.Errorf("persist %s: %w", description, err)
+	}
+	if !fenced && commit != nil {
+		if err := commit(change); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cloneState(state SessionState) SessionState {
+	cloned := state
+	cloned.Feedback = append([]string(nil), state.Feedback...)
+	cloned.Steps = append([]Step(nil), state.Steps...)
+	return cloned
+}
+
 func (s *Session) persist() error {
-	path := filepath.Join(s.dataDir, "sessions", s.state.ID+".json")
+	sessionsDir := filepath.Join(s.dataDir, "sessions")
+	path := filepath.Join(sessionsDir, s.state.ID+".json")
 	data, err := json.MarshalIndent(s.state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal session: %w", err)
 	}
-	return os.WriteFile(path, data, 0o644)
+	temp, err := os.CreateTemp(sessionsDir, "."+s.state.ID+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary session file: %w", err)
+	}
+	tempPath := temp.Name()
+	cleanup := func(cause error) error {
+		closeErr := temp.Close()
+		removeErr := os.Remove(tempPath)
+		if closeErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("close temporary session file: %w", closeErr))
+		}
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cause = errors.Join(cause, fmt.Errorf("remove temporary session file: %w", removeErr))
+		}
+		return cause
+	}
+	if err := temp.Chmod(0o644); err != nil {
+		return cleanup(fmt.Errorf("set session file permissions: %w", err))
+	}
+	if _, err := temp.Write(data); err != nil {
+		return cleanup(fmt.Errorf("write temporary session file: %w", err))
+	}
+	if err := temp.Sync(); err != nil {
+		return cleanup(fmt.Errorf("sync temporary session file: %w", err))
+	}
+	if err := temp.Close(); err != nil {
+		if removeErr := os.Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(
+				fmt.Errorf("close temporary session file: %w", err),
+				fmt.Errorf("remove temporary session file: %w", removeErr),
+			)
+		}
+		return fmt.Errorf("close temporary session file: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		if removeErr := os.Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(
+				fmt.Errorf("replace session file: %w", err),
+				fmt.Errorf("remove temporary session file: %w", removeErr),
+			)
+		}
+		return fmt.Errorf("replace session file: %w", err)
+	}
+	return nil
 }
 
 func generateID() (string, error) {

@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 
 	"github.com/villagelabsco/agent-inbox-question/internal/runner"
@@ -21,9 +20,9 @@ func (a *App) RunRun(ctx context.Context, args []string) error {
 	deps := runner.Deps{
 		DataDir:  a.DataDir,
 		Tasks:    a.Tasks,
-		Runs:     a.Runs,
-		Comments: a.Comments,
-		Output:   os.Stdout,
+		Attempts: a.Attempts,
+		Output:   a.output(),
+		Options:  a.RunnerOptions,
 	}
 
 	return runner.Execute(ctx, deps, id)

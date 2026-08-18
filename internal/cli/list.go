@@ -10,6 +10,7 @@ import (
 
 func (a *App) RunList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	fs.SetOutput(a.errorOutput())
 	statusFlag := fs.String("status", "", "filter by status")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -30,7 +31,9 @@ func (a *App) RunList(args []string) error {
 	}
 
 	if len(tasks) == 0 {
-		fmt.Println("No tasks.")
+		if _, err := fmt.Fprintln(a.output(), "No tasks."); err != nil {
+			return fmt.Errorf("write empty task list: %w", err)
+		}
 		return nil
 	}
 
@@ -46,6 +49,5 @@ func (a *App) RunList(args []string) error {
 		})
 	}
 
-	printTable([]string{"ID", "STATUS", "TITLE", "RUNS", "UPDATED"}, rows)
-	return nil
+	return printTable(a.output(), []string{"ID", "STATUS", "TITLE", "RUNS", "UPDATED"}, rows)
 }

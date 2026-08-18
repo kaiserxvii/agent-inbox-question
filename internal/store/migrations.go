@@ -48,4 +48,24 @@ CREATE TABLE comments (
 		sql: `CREATE INDEX idx_runs_task_id ON runs(task_id);
 CREATE INDEX idx_comments_task_id ON comments(task_id);`,
 	},
+	{
+		version: 4,
+		sql: `ALTER TABLE tasks ADD COLUMN next_eligible_at TEXT;
+ALTER TABLE tasks ADD COLUMN auto_retry_state TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN auto_retry_reason TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_tasks_auto_retry ON tasks(auto_retry_state, next_eligible_at);`,
+	},
+	{
+		version: 5,
+		sql: `ALTER TABLE runs ADD COLUMN owner_token TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN lease_expires_at TEXT;
+ALTER TABLE runs ADD COLUMN start_step INTEGER NOT NULL DEFAULT 0;
+UPDATE runs SET lease_expires_at = started_at
+WHERE status = 'running' AND lease_expires_at IS NULL;
+CREATE INDEX idx_runs_expired_lease ON runs(status, lease_expires_at);`,
+	},
+	{
+		version: 6,
+		sql:     `ALTER TABLE runs ADD COLUMN session_checkpoint TEXT NOT NULL DEFAULT '';`,
+	},
 }

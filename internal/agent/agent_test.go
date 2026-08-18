@@ -2,9 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 )
 
 func TestDeterministicPlan(t *testing.T) {
@@ -45,8 +49,8 @@ func TestDirectiveParsing(t *testing.T) {
 	if len(s.state.Steps) != 3 {
 		t.Errorf("steps = %d, want 3", len(s.state.Steps))
 	}
-	if s.state.TokenBudget != 500 {
-		t.Errorf("budget = %d, want 500", s.state.TokenBudget)
+	if s.ConfiguredBudget() != 500 {
+		t.Errorf("configured budget = %d, want 500", s.ConfiguredBudget())
 	}
 }
 
@@ -121,6 +125,77 @@ func TestFailAt(t *testing.T) {
 	}
 }
 
+func TestRunReportsFailureWhenAgentErrorStateCannotBePersisted(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	s, err := Start(
+		dir,
+		"t",
+		"[steps:3] [fail-at:1] [budget:5000]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	sessionPath := filepath.Join(dir, "sessions", s.ID()+".json")
+	if err := os.Remove(sessionPath); err != nil {
+		t.Fatalf("Remove session file: %v", err)
+	}
+	if err := os.Mkdir(sessionPath, 0o755); err != nil {
+		t.Fatalf("replace session file with directory: %v", err)
+	}
+
+	_, err = s.Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("Run returned nil, want persistence error")
+	}
+	if !strings.Contains(err.Error(), "persist agent error") {
+		t.Errorf("Run error = %q, want agent error persistence context", err)
+	}
+}
+
+func TestRunDoesNotPublishStepBeforeItIsPersisted(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	s, err := Start(
+		dir,
+		"t",
+		"[steps:1] [budget:5000]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	sessionPath := filepath.Join(dir, "sessions", s.ID()+".json")
+	if err := os.Remove(sessionPath); err != nil {
+		t.Fatalf("Remove session file: %v", err)
+	}
+	if err := os.Mkdir(sessionPath, 0o755); err != nil {
+		t.Fatalf("replace session file with directory: %v", err)
+	}
+
+	var events []Event
+	_, err = s.Run(context.Background(), func(event Event) {
+		events = append(events, event)
+	})
+	if err == nil {
+		t.Fatal("Run returned nil, want persistence error")
+	}
+	if len(events) != 0 {
+		t.Errorf("published %d events for undurable work, want 0", len(events))
+	}
+}
+
 func TestLoadAndContinue(t *testing.T) {
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, "sessions"), 0o755)
@@ -167,6 +242,251 @@ func TestLoadAndContinue(t *testing.T) {
 	}
 }
 
+func TestLoadPreservesAttemptBudgetState(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	session, err := Start(dir, "t", "[steps:1] [budget:1]", nil, WithNoDelay())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := session.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	wantBudget := session.AttemptAllowance()
+	wantRemaining := session.RemainingBudget()
+	wantTokensUsed := session.TokensUsed()
+	wantSummary := Summary(session)
+
+	loaded, err := Load(dir, session.ID(), WithNoDelay())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.AttemptAllowance() != wantBudget {
+		t.Errorf("loaded allowance = %d, want preserved allowance %d", loaded.AttemptAllowance(), wantBudget)
+	}
+	if loaded.TokensUsed() != wantTokensUsed {
+		t.Errorf("loaded tokens used = %d, want preserved usage %d", loaded.TokensUsed(), wantTokensUsed)
+	}
+	if loaded.RemainingBudget() != wantRemaining {
+		t.Errorf("loaded remaining budget = %d, want %d", loaded.RemainingBudget(), wantRemaining)
+	}
+	if got := Summary(loaded); got != wantSummary {
+		t.Errorf("loaded summary = %q, want preserved state summary %q", got, wantSummary)
+	}
+}
+
+func TestBeginAttemptUsesExplicitAllowanceWithoutChangingConfiguredBudget(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	session, err := Start(dir, "t", "[steps:10] [budget:400]", nil, WithNoDelay())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := session.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if session.TokensUsed() == 0 {
+		t.Fatal("fixture used no tokens before exhaustion")
+	}
+
+	if err := session.BeginAttempt(250, domain.ProviderWindowFresh); err != nil {
+		t.Fatalf("BeginAttempt: %v", err)
+	}
+	if session.ConfiguredBudget() != 400 {
+		t.Errorf("configured budget = %d, want 400", session.ConfiguredBudget())
+	}
+	if session.AttemptAllowance() != 250 {
+		t.Errorf("attempt allowance = %d, want 250", session.AttemptAllowance())
+	}
+	if session.RemainingBudget() != 250 {
+		t.Errorf("remaining budget = %d, want 250", session.RemainingBudget())
+	}
+	if session.TokensUsed() != 0 {
+		t.Errorf("attempt usage = %d, want 0", session.TokensUsed())
+	}
+	if got := session.AttemptCheckpoint().WindowOrigin; got != domain.ProviderWindowFresh {
+		t.Errorf("window origin = %q, want fresh", got)
+	}
+	session.ContinueAttempt()
+	if got := session.AttemptCheckpoint().WindowOrigin; got != domain.ProviderWindowContinued {
+		t.Errorf("continued window origin = %q, want continued", got)
+	}
+}
+
+func TestRunFencedDoesNotExecuteAfterOwnershipIsLost(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("create sessions directory: %v", err)
+	}
+	session, err := Start(
+		dir,
+		"stale executor",
+		"[steps:1] [budget:5000]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	executed := 0
+	_, err = session.RunFenced(
+		context.Background(),
+		func() error { return domain.ErrLeaseLost },
+		func(StateCommit) error {
+			executed++
+			return nil
+		},
+	)
+	if !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("RunFenced error = %v, want ErrLeaseLost", err)
+	}
+	if executed != 0 || session.CompletedSteps() != 0 {
+		t.Errorf("executed events = %d, completed steps = %d; want zero", executed, session.CompletedSteps())
+	}
+	loaded, err := Load(dir, session.ID(), WithNoDelay())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.CompletedSteps() != 0 {
+		t.Errorf("persisted completed steps = %d, want zero", loaded.CompletedSteps())
+	}
+}
+
+func TestRunFencedRollsBackRejectedTerminalState(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("create sessions directory: %v", err)
+	}
+	session, err := Start(
+		dir,
+		"terminal lease loss",
+		"[steps:1] [budget:1]",
+		nil,
+		WithNoDelay(),
+	)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := session.BindAttempt(1, "owner"); err != nil {
+		t.Fatalf("BindAttempt: %v", err)
+	}
+
+	_, err = session.RunFenced(
+		context.Background(),
+		func() error { return nil },
+		func(change StateCommit) error {
+			if change.Event != nil {
+				t.Fatalf("terminal transition unexpectedly emitted event %#v", change.Event)
+			}
+			return domain.ErrLeaseLost
+		},
+	)
+	if !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("RunFenced error = %v, want ErrLeaseLost", err)
+	}
+	if got := session.AttemptCheckpoint().HaltReason; got != HaltRunning {
+		t.Errorf("in-memory halt reason = %q, want %q", got, HaltRunning)
+	}
+	loaded, err := Load(dir, session.ID(), WithNoDelay())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := loaded.AttemptCheckpoint().HaltReason; got != HaltRunning {
+		t.Errorf("persisted halt reason = %q, want %q", got, HaltRunning)
+	}
+}
+
+func TestRunFencedPublishesTerminalStatesWithoutEvents(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		cancel      bool
+		wantOutcome OutcomeKind
+		wantHalt    HaltReason
+	}{
+		{
+			name:        "token exhaustion",
+			description: "[steps:1] [budget:1]",
+			wantOutcome: TokenBudgetExhausted,
+			wantHalt:    HaltTokenExhausted,
+		},
+		{
+			name:        "agent error",
+			description: "[steps:1] [fail-at:1] [budget:5000]",
+			wantOutcome: Errored,
+			wantHalt:    HaltAgentError,
+		},
+		{
+			name:        "interruption",
+			description: "[steps:1] [budget:5000]",
+			cancel:      true,
+			wantOutcome: Interrupted,
+			wantHalt:    HaltInterrupted,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+				t.Fatalf("create sessions directory: %v", err)
+			}
+			session, err := Start(
+				dir,
+				test.name,
+				test.description,
+				nil,
+				WithNoDelay(),
+			)
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if err := session.BindAttempt(1, "owner"); err != nil {
+				t.Fatalf("BindAttempt: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if test.cancel {
+				cancel()
+			}
+			var commits []StateCommit
+			outcome, err := session.RunFenced(
+				ctx,
+				func() error { return nil },
+				func(change StateCommit) error {
+					commits = append(commits, change)
+					return nil
+				},
+			)
+			if err != nil {
+				t.Fatalf("RunFenced: %v", err)
+			}
+			if outcome.Kind != test.wantOutcome {
+				t.Errorf("outcome = %d, want %d", outcome.Kind, test.wantOutcome)
+			}
+			if len(commits) != 1 {
+				t.Fatalf("commits = %d, want one terminal commit", len(commits))
+			}
+			if commits[0].Event != nil {
+				t.Errorf("terminal commit event = %#v, want nil", commits[0].Event)
+			}
+			restored, err := Restore(dir, commits[0].Checkpoint, WithNoDelay())
+			if err != nil {
+				t.Fatalf("Restore committed checkpoint: %v", err)
+			}
+			if got := restored.AttemptCheckpoint().HaltReason; got != test.wantHalt {
+				t.Errorf("committed halt reason = %q, want %q", got, test.wantHalt)
+			}
+		})
+	}
+}
+
 func TestFeedbackSteps(t *testing.T) {
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, "sessions"), 0o755)
@@ -191,8 +511,8 @@ func TestContextCancellation(t *testing.T) {
 
 	s, _ := Start(dir, "t", "[steps:5] [budget:5000]", nil, WithNoDelay())
 	outcome, _ := s.Run(ctx, nil)
-	if outcome.Kind != Errored {
-		t.Errorf("outcome = %d, want Errored on cancelled context", outcome.Kind)
+	if outcome.Kind != Interrupted {
+		t.Errorf("outcome = %d, want Interrupted on cancelled context", outcome.Kind)
 	}
 }
 
