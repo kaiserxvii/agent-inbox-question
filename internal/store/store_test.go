@@ -147,21 +147,19 @@ func TestMigrationIdempotency(t *testing.T) {
 	db2.Close()
 }
 
-func TestRunCRUD(t *testing.T) {
+func TestAttemptLifecycle(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
 	runs := NewRunRepo(db)
 
 	task, err := tasks.Create("t", "")
 	if err != nil {
 		t.Fatalf("Create task: %v", err)
 	}
-	if err := tasks.Transition(task.ID, domain.TaskTodo, domain.TaskInProgress); err != nil {
-		t.Fatalf("transition task: %v", err)
-	}
-	run, err := runs.Create(task.ID, "abc123", 1200)
+	run, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "abc123", 1200)
 	if err != nil {
-		t.Fatalf("Create run: %v", err)
+		t.Fatalf("StartAttempt: %v", err)
 	}
 	if run.Status != domain.RunRunning {
 		t.Errorf("status = %q, want running", run.Status)
@@ -170,18 +168,16 @@ func TestRunCRUD(t *testing.T) {
 		t.Errorf("budget = %d, want 1200", run.TokenBudget)
 	}
 
-	if err := runs.UpdateProgress(run.ID, "partial output", 300); err != nil {
+	if err := attempts.UpdateProgress(run.ID, "partial output", 300); err != nil {
 		t.Fatalf("UpdateProgress: %v", err)
 	}
 
-	if err := runs.FinishAttempt(FinishAttemptParams{
+	if err := attempts.FinishAttempt(FinishAttemptParams{
 		RunID:      run.ID,
 		TaskID:     task.ID,
-		RunStatus:  domain.RunSucceeded,
-		ExitReason: domain.ExitCompleted,
+		Outcome:    domain.AttemptCompleted,
 		Output:     "final output",
 		TokensUsed: 800,
-		TaskStatus: domain.TaskDone,
 	}); err != nil {
 		t.Fatalf("FinishAttempt: %v", err)
 	}
@@ -205,31 +201,132 @@ func TestRunCRUD(t *testing.T) {
 	}
 }
 
-func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
+func TestStartAttemptRollsBackClaimWhenRunCannotBeRecorded(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	if _, err := db.sql.Exec(`
+		CREATE TRIGGER reject_run_insert
+		BEFORE INSERT ON runs
+		BEGIN
+			SELECT RAISE(ABORT, 'run insert rejected');
+		END;
+	`); err != nil {
+		t.Fatalf("create rejection trigger: %v", err)
+	}
+
+	_, err = attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1000)
+	if err == nil {
+		t.Fatal("StartAttempt returned nil, want run creation error")
+	}
+
+	got, err := tasks.Get(task.ID)
+	if err != nil {
+		t.Fatalf("Get task: %v", err)
+	}
+	if got.Status != domain.TaskTodo {
+		t.Errorf("task status = %q, want todo after rollback", got.Status)
+	}
+}
+
+func TestStartAttemptConflictReportsObservedTaskStatus(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	if _, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "winner", 1000); err != nil {
+		t.Fatalf("first StartAttempt: %v", err)
+	}
+
+	_, err = attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "loser", 1000)
+	var conflict *domain.TaskStatusConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("second StartAttempt error = %v, want TaskStatusConflict", err)
+	}
+	if conflict.Observed != domain.TaskInProgress {
+		t.Errorf("observed status = %q, want in_progress", conflict.Observed)
+	}
+}
+
+func TestStartAttemptRejectsAResumeOfAnAlreadyConsumedRun(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
 	runs := NewRunRepo(db)
 
 	task, err := tasks.Create("t", "")
 	if err != nil {
 		t.Fatalf("Create task: %v", err)
 	}
-	if err := tasks.Transition(task.ID, domain.TaskTodo, domain.TaskInProgress); err != nil {
-		t.Fatalf("transition task: %v", err)
-	}
-	run, err := runs.Create(task.ID, "session", 1000)
+	first, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1)
 	if err != nil {
-		t.Fatalf("Create run: %v", err)
+		t.Fatalf("first StartAttempt: %v", err)
+	}
+	if err := attempts.FinishAttempt(FinishAttemptParams{
+		RunID: first.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+	}); err != nil {
+		t.Fatalf("first FinishAttempt: %v", err)
+	}
+	second, err := attempts.StartAttempt(task.ID, domain.TaskFailed, first.ID, "session", 1)
+	if err != nil {
+		t.Fatalf("second StartAttempt: %v", err)
+	}
+	if err := attempts.FinishAttempt(FinishAttemptParams{
+		RunID: second.ID, TaskID: task.ID, Outcome: domain.AttemptTokenExhausted,
+	}); err != nil {
+		t.Fatalf("second FinishAttempt: %v", err)
 	}
 
-	err = runs.FinishAttempt(FinishAttemptParams{
+	_, err = attempts.StartAttempt(task.ID, domain.TaskFailed, first.ID, "session", 1)
+	var conflict *domain.TaskStatusConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("stale StartAttempt error = %v, want TaskStatusConflict", err)
+	}
+	if conflict.Observed != domain.TaskFailed {
+		t.Errorf("observed status = %q, want failed", conflict.Observed)
+	}
+	if conflict.ObservedRunID != second.ID {
+		t.Errorf("observed run ID = %d, want %d", conflict.ObservedRunID, second.ID)
+	}
+	count, err := runs.CountByTask(task.ID)
+	if err != nil {
+		t.Fatalf("CountByTask: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("runs = %d, want 2", count)
+	}
+}
+
+func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	run, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1000)
+	if err != nil {
+		t.Fatalf("StartAttempt: %v", err)
+	}
+
+	err = attempts.FinishAttempt(FinishAttemptParams{
 		RunID:         run.ID,
 		TaskID:        task.ID + 1,
-		RunStatus:     domain.RunSucceeded,
-		ExitReason:    domain.ExitCompleted,
+		Outcome:       domain.AttemptCompleted,
 		Output:        "completed output",
 		TokensUsed:    500,
-		TaskStatus:    domain.TaskDone,
 		CommentAuthor: "agent",
 		CommentBody:   "complete",
 	})
@@ -260,32 +357,28 @@ func TestFinishAttemptRollsBackWhenTaskCannotTransition(t *testing.T) {
 	}
 }
 
-func TestFinishAttemptRejectsInconsistentOutcome(t *testing.T) {
+func TestFinishAttemptRejectsUnknownOutcome(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
 	runs := NewRunRepo(db)
 
 	task, err := tasks.Create("t", "")
 	if err != nil {
 		t.Fatalf("Create task: %v", err)
 	}
-	if err := tasks.Transition(task.ID, domain.TaskTodo, domain.TaskInProgress); err != nil {
-		t.Fatalf("transition task: %v", err)
-	}
-	run, err := runs.Create(task.ID, "session", 1000)
+	run, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "session", 1000)
 	if err != nil {
-		t.Fatalf("Create run: %v", err)
+		t.Fatalf("StartAttempt: %v", err)
 	}
 
-	err = runs.FinishAttempt(FinishAttemptParams{
-		RunID:      run.ID,
-		TaskID:     task.ID,
-		RunStatus:  domain.RunSucceeded,
-		ExitReason: domain.ExitCompleted,
-		TaskStatus: domain.TaskFailed,
+	err = attempts.FinishAttempt(FinishAttemptParams{
+		RunID:   run.ID,
+		TaskID:  task.ID,
+		Outcome: domain.AttemptOutcome("unknown"),
 	})
 	if err == nil {
-		t.Fatal("FinishAttempt returned nil for inconsistent outcome")
+		t.Fatal("FinishAttempt returned nil for unknown outcome")
 	}
 
 	runList, err := runs.ListByTask(task.ID)
@@ -376,11 +469,22 @@ func TestOldestByStatus(t *testing.T) {
 func TestRunCountByTask(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
 	runs := NewRunRepo(db)
 
 	task, _ := tasks.Create("t", "")
-	runs.Create(task.ID, "s1", 1000)
-	runs.Create(task.ID, "s2", 1000)
+	first, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "s1", 1000)
+	if err != nil {
+		t.Fatalf("first StartAttempt: %v", err)
+	}
+	if err := attempts.FinishAttempt(FinishAttemptParams{
+		RunID: first.ID, TaskID: task.ID, Outcome: domain.AttemptAgentError,
+	}); err != nil {
+		t.Fatalf("first FinishAttempt: %v", err)
+	}
+	if _, err := attempts.StartAttempt(task.ID, domain.TaskFailed, first.ID, "s2", 1000); err != nil {
+		t.Fatalf("second StartAttempt: %v", err)
+	}
 
 	count, err := runs.CountByTask(task.ID)
 	if err != nil {
@@ -388,6 +492,37 @@ func TestRunCountByTask(t *testing.T) {
 	}
 	if count != 2 {
 		t.Errorf("count = %d, want 2", count)
+	}
+}
+
+func TestLatestRunByTaskReturnsNewestAttempt(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("t", "")
+	if err != nil {
+		t.Fatalf("Create task: %v", err)
+	}
+	first, err := attempts.StartAttempt(task.ID, domain.TaskTodo, 0, "first", 1000)
+	if err != nil {
+		t.Fatalf("first StartAttempt: %v", err)
+	}
+	if err := tasks.Transition(task.ID, domain.TaskInProgress, domain.TaskFailed); err != nil {
+		t.Fatalf("fail first attempt task: %v", err)
+	}
+	second, err := attempts.StartAttempt(task.ID, domain.TaskFailed, first.ID, "second", 1000)
+	if err != nil {
+		t.Fatalf("second StartAttempt: %v", err)
+	}
+
+	latest, err := runs.LatestByTask(task.ID)
+	if err != nil {
+		t.Fatalf("LatestByTask: %v", err)
+	}
+	if latest.ID != second.ID {
+		t.Errorf("latest run ID = %d, want %d", latest.ID, second.ID)
 	}
 }
 

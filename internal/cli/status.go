@@ -14,17 +14,18 @@ func (a *App) RunStatus() error {
 
 	statuses := []domain.TaskStatus{domain.TaskTodo, domain.TaskInProgress, domain.TaskDone, domain.TaskFailed}
 	total := 0
+	out := newOutputPrinter(a.output())
 	for _, s := range statuses {
 		c := counts[s]
 		total += c
-		fmt.Printf("%-12s %d\n", s, c)
+		out.Printf("%-12s %d\n", s, c)
 	}
-	fmt.Printf("%-12s %d\n", "total", total)
+	out.Printf("%-12s %d\n", "total", total)
 
 	inProgress, err := a.Tasks.OldestByStatus(domain.TaskInProgress)
 	if err == nil && inProgress != nil {
-		fmt.Printf("\nIn progress: #%d %s\n", inProgress.ID, inProgress.Title)
+		out.Printf("\nIn progress: #%d %s\n", inProgress.ID, inProgress.Title)
 	}
 
-	return nil
+	return out.Err()
 }

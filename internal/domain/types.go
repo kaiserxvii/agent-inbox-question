@@ -42,6 +42,45 @@ const (
 	ExitTokenBudgetExhausted ExitReason = "token_budget_exhausted"
 )
 
+type AttemptOutcome string
+
+const (
+	AttemptCompleted      AttemptOutcome = "completed"
+	AttemptAgentError     AttemptOutcome = "agent_error"
+	AttemptTokenExhausted AttemptOutcome = "token_exhausted"
+)
+
+type TerminalAttemptState struct {
+	RunStatus  RunStatus
+	ExitReason ExitReason
+	TaskStatus TaskStatus
+}
+
+func (o AttemptOutcome) TerminalState() (TerminalAttemptState, error) {
+	switch o {
+	case AttemptCompleted:
+		return TerminalAttemptState{
+			RunStatus:  RunSucceeded,
+			ExitReason: ExitCompleted,
+			TaskStatus: TaskDone,
+		}, nil
+	case AttemptAgentError:
+		return TerminalAttemptState{
+			RunStatus:  RunErrored,
+			ExitReason: ExitAgentError,
+			TaskStatus: TaskFailed,
+		}, nil
+	case AttemptTokenExhausted:
+		return TerminalAttemptState{
+			RunStatus:  RunTokenExhausted,
+			ExitReason: ExitTokenBudgetExhausted,
+			TaskStatus: TaskFailed,
+		}, nil
+	default:
+		return TerminalAttemptState{}, fmt.Errorf("unknown attempt outcome: %q", o)
+	}
+}
+
 type Task struct {
 	ID          int64
 	Title       string
@@ -79,6 +118,30 @@ var (
 	ErrNotFound          = errors.New("not found")
 )
 
+// TaskStatusConflict reports the task status observed when a compare-and-swap
+// transition loses a race.
+type TaskStatusConflict struct {
+	TaskID        int64
+	Expected      TaskStatus
+	Observed      TaskStatus
+	ExpectedRunID int64
+	ObservedRunID int64
+}
+
+func (e *TaskStatusConflict) Error() string {
+	return fmt.Sprintf(
+		"%v: task %d expected status %q, observed %q",
+		ErrConflict,
+		e.TaskID,
+		e.Expected,
+		e.Observed,
+	)
+}
+
+func (e *TaskStatusConflict) Unwrap() error {
+	return ErrConflict
+}
+
 var allowedTransitions = map[TaskStatus]map[TaskStatus]bool{
 	TaskTodo:       {TaskInProgress: true},
 	TaskInProgress: {TaskDone: true, TaskFailed: true},
@@ -90,25 +153,4 @@ func Transition(from, to TaskStatus) error {
 		return nil
 	}
 	return fmt.Errorf("%w: cannot transition from %q to %q", ErrInvalidTransition, from, to)
-}
-
-func ValidateTerminalOutcome(runStatus RunStatus, exitReason ExitReason, taskStatus TaskStatus) error {
-	valid := false
-	switch runStatus {
-	case RunSucceeded:
-		valid = exitReason == ExitCompleted && taskStatus == TaskDone
-	case RunErrored:
-		valid = exitReason == ExitAgentError && taskStatus == TaskFailed
-	case RunTokenExhausted:
-		valid = exitReason == ExitTokenBudgetExhausted && taskStatus == TaskFailed
-	}
-	if !valid {
-		return fmt.Errorf(
-			"inconsistent terminal outcome: run status %q, exit reason %q, task status %q",
-			runStatus,
-			exitReason,
-			taskStatus,
-		)
-	}
-	return nil
 }

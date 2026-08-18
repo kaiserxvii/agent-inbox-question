@@ -49,18 +49,22 @@ type Step struct {
 }
 
 type SessionState struct {
-	ID           string   `json:"id"`
-	TaskTitle    string   `json:"task_title"`
-	TaskDesc     string   `json:"task_description"`
-	Feedback     []string `json:"feedback,omitempty"`
-	Steps        []Step   `json:"steps"`
-	TokenBudget  int      `json:"token_budget"`
-	TokensUsed   int      `json:"tokens_used"`
-	NextStep     int      `json:"next_step"`
-	Completed    bool     `json:"completed"`
-	ErroredAt    int      `json:"errored_at,omitempty"`
-	ErrorMessage string   `json:"error_message,omitempty"`
-	BudgetHalted bool     `json:"budget_halted"`
+	ID                    string   `json:"id"`
+	TaskTitle             string   `json:"task_title"`
+	TaskDesc              string   `json:"task_description"`
+	Feedback              []string `json:"feedback,omitempty"`
+	Steps                 []Step   `json:"steps"`
+	BudgetModelVersion    int      `json:"budget_model_version"`
+	ConfiguredTokenBudget int      `json:"configured_token_budget"`
+	AttemptTokenAllowance int      `json:"attempt_token_allowance"`
+	TokensRemaining       int      `json:"tokens_remaining"`
+	TokensUsed            int      `json:"tokens_used"`
+	NextStep              int      `json:"next_step"`
+	Completed             bool     `json:"completed"`
+	ErroredAt             int      `json:"errored_at,omitempty"`
+	ErrorMessage          string   `json:"error_message,omitempty"`
+	BudgetHalted          bool     `json:"budget_halted"`
+	LegacyTokenBudget     int      `json:"token_budget,omitempty"`
 }
 
 type Session struct {
@@ -99,14 +103,17 @@ func Start(dataDir, taskTitle, taskDescription string, feedback []string, opts .
 	steps := buildSteps(h, stepCount, feedback)
 
 	state := SessionState{
-		ID:          id,
-		TaskTitle:   taskTitle,
-		TaskDesc:    taskDescription,
-		Feedback:    feedback,
-		Steps:       steps,
-		TokenBudget: budget,
-		TokensUsed:  0,
-		NextStep:    0,
+		ID:                    id,
+		TaskTitle:             taskTitle,
+		TaskDesc:              taskDescription,
+		Feedback:              feedback,
+		Steps:                 steps,
+		BudgetModelVersion:    2,
+		ConfiguredTokenBudget: budget,
+		AttemptTokenAllowance: budget,
+		TokensRemaining:       budget,
+		TokensUsed:            0,
+		NextStep:              0,
 	}
 
 	if failAt, ok := directives["fail-at"]; ok {
@@ -134,10 +141,17 @@ func Load(dataDir, sessionID string, opts ...Option) (*Session, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("parse session %s: %w", sessionID, err)
 	}
-	state.TokenBudget = state.TokenBudget - state.TokensUsed + DefaultTokenBudget
-	state.TokensUsed = 0
-	state.BudgetHalted = false
-
+	if state.BudgetModelVersion < 2 {
+		state.BudgetModelVersion = 2
+		if state.ConfiguredTokenBudget == 0 {
+			state.ConfiguredTokenBudget = state.LegacyTokenBudget
+		}
+		state.AttemptTokenAllowance = state.LegacyTokenBudget
+		if state.TokensRemaining == 0 && state.LegacyTokenBudget > 0 {
+			state.TokensRemaining = max(0, state.LegacyTokenBudget-state.TokensUsed)
+		}
+		state.LegacyTokenBudget = 0
+	}
 	s := &Session{state: state, dataDir: dataDir}
 	for _, o := range opts {
 		o(s)
@@ -145,9 +159,25 @@ func Load(dataDir, sessionID string, opts ...Option) (*Session, error) {
 	return s, nil
 }
 
-func (s *Session) ID() string      { return s.state.ID }
-func (s *Session) Budget() int     { return s.state.TokenBudget }
-func (s *Session) TokensUsed() int { return s.state.TokensUsed }
+func (s *Session) ID() string            { return s.state.ID }
+func (s *Session) ConfiguredBudget() int { return s.state.ConfiguredTokenBudget }
+func (s *Session) AttemptAllowance() int { return s.state.AttemptTokenAllowance }
+func (s *Session) RemainingBudget() int  { return s.state.TokensRemaining }
+func (s *Session) TokensUsed() int       { return s.state.TokensUsed }
+
+// BeginAttempt applies an explicit provider-window allowance to the next
+// attempt. It only changes in-memory attempt state; Run persists that state as
+// work progresses.
+func (s *Session) BeginAttempt(allowance int) error {
+	if allowance < 0 {
+		return fmt.Errorf("attempt allowance must be non-negative: %d", allowance)
+	}
+	s.state.AttemptTokenAllowance = allowance
+	s.state.TokensRemaining = allowance
+	s.state.TokensUsed = 0
+	s.state.BudgetHalted = false
+	return nil
+}
 
 func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error) {
 	failAt := -1
@@ -177,7 +207,7 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 			return Outcome{Kind: Errored, Err: errors.New(s.state.ErrorMessage)}, nil
 		}
 
-		if s.state.TokensUsed+step.TokenCost > s.state.TokenBudget {
+		if step.TokenCost > s.state.TokensRemaining {
 			s.state.BudgetHalted = true
 			if err := s.persist(); err != nil {
 				return Outcome{}, fmt.Errorf("persist token exhaustion: %w", err)
@@ -202,6 +232,7 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 		step.Output = fmt.Sprintf("[step %d/%d] %s: processed", stepIdx, len(s.state.Steps), step.Name)
 		step.Done = true
 		s.state.TokensUsed += step.TokenCost
+		s.state.TokensRemaining -= step.TokenCost
 		s.state.NextStep++
 
 		if err := s.persist(); err != nil {
@@ -237,12 +268,56 @@ func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error)
 }
 
 func (s *Session) persist() error {
-	path := filepath.Join(s.dataDir, "sessions", s.state.ID+".json")
+	sessionsDir := filepath.Join(s.dataDir, "sessions")
+	path := filepath.Join(sessionsDir, s.state.ID+".json")
 	data, err := json.MarshalIndent(s.state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal session: %w", err)
 	}
-	return os.WriteFile(path, data, 0o644)
+	temp, err := os.CreateTemp(sessionsDir, "."+s.state.ID+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary session file: %w", err)
+	}
+	tempPath := temp.Name()
+	cleanup := func(cause error) error {
+		closeErr := temp.Close()
+		removeErr := os.Remove(tempPath)
+		if closeErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("close temporary session file: %w", closeErr))
+		}
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cause = errors.Join(cause, fmt.Errorf("remove temporary session file: %w", removeErr))
+		}
+		return cause
+	}
+	if err := temp.Chmod(0o644); err != nil {
+		return cleanup(fmt.Errorf("set session file permissions: %w", err))
+	}
+	if _, err := temp.Write(data); err != nil {
+		return cleanup(fmt.Errorf("write temporary session file: %w", err))
+	}
+	if err := temp.Sync(); err != nil {
+		return cleanup(fmt.Errorf("sync temporary session file: %w", err))
+	}
+	if err := temp.Close(); err != nil {
+		if removeErr := os.Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(
+				fmt.Errorf("close temporary session file: %w", err),
+				fmt.Errorf("remove temporary session file: %w", removeErr),
+			)
+		}
+		return fmt.Errorf("close temporary session file: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		if removeErr := os.Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(
+				fmt.Errorf("replace session file: %w", err),
+				fmt.Errorf("remove temporary session file: %w", removeErr),
+			)
+		}
+		return fmt.Errorf("replace session file: %w", err)
+	}
+	return nil
 }
 
 func generateID() (string, error) {

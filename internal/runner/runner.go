@@ -13,19 +13,22 @@ import (
 )
 
 type Deps struct {
-	DataDir string
-	Tasks   *store.TaskRepo
-	Runs    *store.RunRepo
-	Output  io.Writer
+	DataDir  string
+	Tasks    *store.TaskRepo
+	Runs     *store.RunRepo
+	Attempts *store.AttemptRepo
+	Output   io.Writer
+	Options  Options
+}
+
+type Options struct {
 	NoDelay bool
 }
 
 // AttemptResult is the recorded outcome callers can act on without re-reading
 // task and run state.
 type AttemptResult struct {
-	TaskStatus domain.TaskStatus
-	RunStatus  domain.RunStatus
-	ExitReason domain.ExitReason
+	Outcome domain.AttemptOutcome
 }
 
 func Execute(ctx context.Context, deps Deps, taskID int64) error {
@@ -34,24 +37,29 @@ func Execute(ctx context.Context, deps Deps, taskID int64) error {
 		return fmt.Errorf("get task %d: %w", taskID, err)
 	}
 
-	if err := deps.Tasks.Transition(taskID, domain.TaskTodo, domain.TaskInProgress); err != nil {
-		return fmt.Errorf("claim task %d: %w", taskID, err)
+	if task.Status != domain.TaskTodo {
+		return fmt.Errorf("execute task: %w", &domain.TaskStatusConflict{
+			TaskID:   taskID,
+			Expected: domain.TaskTodo,
+			Observed: task.Status,
+		})
 	}
 
 	var opts []agent.Option
-	if deps.NoDelay {
+	if deps.Options.NoDelay {
 		opts = append(opts, agent.WithNoDelay())
 	}
 	session, err := agent.Start(deps.DataDir, task.Title, task.Description, nil, opts...)
 	if err != nil {
-		return restoreFailedTask(
-			deps,
-			taskID,
-			fmt.Errorf("start agent session: %w", err),
-		)
+		return fmt.Errorf("start agent session: %w", err)
 	}
 
-	_, err = runClaimedSession(ctx, deps, taskID, session)
+	run, err := deps.Attempts.StartAttempt(taskID, domain.TaskTodo, 0, session.ID(), session.AttemptAllowance())
+	if err != nil {
+		return fmt.Errorf("start attempt for task %d: %w", taskID, err)
+	}
+
+	_, err = runAttempt(ctx, deps, taskID, session, run)
 	return err
 }
 
@@ -66,7 +74,11 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 		if task.Status == domain.TaskInProgress {
 			return AttemptResult{}, fmt.Errorf(
 				"%w: task %d cannot be resumed: status is %q",
-				domain.ErrConflict,
+				&domain.TaskStatusConflict{
+					TaskID:   taskID,
+					Expected: domain.TaskFailed,
+					Observed: task.Status,
+				},
 				taskID,
 				task.Status,
 			)
@@ -74,68 +86,67 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 		return AttemptResult{}, fmt.Errorf("task %d cannot be resumed: status is %q", taskID, task.Status)
 	}
 
-	if err := deps.Tasks.Transition(taskID, domain.TaskFailed, domain.TaskInProgress); err != nil {
-		if errors.Is(err, domain.ErrConflict) {
-			current, getErr := deps.Tasks.Get(taskID)
-			if getErr == nil {
-				return AttemptResult{}, fmt.Errorf(
-					"%w: task %d cannot be resumed: status is %q",
-					domain.ErrConflict,
-					taskID,
-					current.Status,
-				)
-			}
-			return AttemptResult{}, errors.Join(
-				fmt.Errorf("claim task %d for resume: %w", taskID, err),
-				fmt.Errorf("get current task status: %w", getErr),
-			)
-		}
-		return AttemptResult{}, fmt.Errorf("claim task %d for resume: %w", taskID, err)
-	}
-
-	runs, err := deps.Runs.ListByTask(taskID)
+	previous, err := deps.Runs.LatestByTask(taskID)
 	if err != nil {
-		return AttemptResult{}, restoreFailedTask(
-			deps,
-			taskID,
-			fmt.Errorf("list runs for task %d: %w", taskID, err),
-		)
-	}
-	if len(runs) == 0 {
-		return AttemptResult{}, restoreFailedTask(
-			deps,
-			taskID,
-			fmt.Errorf("task %d has no run to resume", taskID),
-		)
+		return AttemptResult{}, fmt.Errorf("latest run for task %d: %w", taskID, err)
 	}
 
 	var opts []agent.Option
-	if deps.NoDelay {
+	if deps.Options.NoDelay {
 		opts = append(opts, agent.WithNoDelay())
 	}
-	previous := runs[len(runs)-1]
 	session, err := agent.Load(deps.DataDir, previous.SessionID, opts...)
 	if err != nil {
-		return AttemptResult{}, restoreFailedTask(
-			deps,
-			taskID,
-			fmt.Errorf("load agent session: %w", err),
-		)
+		return AttemptResult{}, fmt.Errorf("load agent session: %w", err)
 	}
 
-	return runClaimedSession(ctx, deps, taskID, session)
+	var allowance int
+	switch previous.ExitReason {
+	case domain.ExitAgentError:
+		allowance = session.ConfiguredBudget()
+	case domain.ExitTokenBudgetExhausted:
+		allowance = session.ConfiguredBudget()
+	case domain.ExitNone:
+		// A concurrent resume can insert its running attempt after our task
+		// preflight but before LatestByTask. Prepare the shared session and let
+		// StartAttempt return the authoritative status conflict.
+		allowance = session.ConfiguredBudget()
+	default:
+		return AttemptResult{}, fmt.Errorf(
+			"task %d cannot resume run %d with exit reason %q",
+			taskID,
+			previous.ID,
+			previous.ExitReason,
+		)
+	}
+	if err := session.BeginAttempt(allowance); err != nil {
+		return AttemptResult{}, fmt.Errorf("begin resumed session attempt: %w", err)
+	}
+
+	run, err := deps.Attempts.StartAttempt(
+		taskID,
+		domain.TaskFailed,
+		previous.ID,
+		session.ID(),
+		session.AttemptAllowance(),
+	)
+	if err != nil {
+		var conflict *domain.TaskStatusConflict
+		if errors.As(err, &conflict) {
+			return AttemptResult{}, fmt.Errorf(
+				"%w: task %d cannot be resumed: status is %q",
+				conflict,
+				taskID,
+				conflict.Observed,
+			)
+		}
+		return AttemptResult{}, fmt.Errorf("start resumed attempt for task %d: %w", taskID, err)
+	}
+
+	return runAttempt(ctx, deps, taskID, session, run)
 }
 
-func runClaimedSession(ctx context.Context, deps Deps, taskID int64, session *agent.Session) (AttemptResult, error) {
-	run, err := deps.Runs.Create(taskID, session.ID(), session.Budget())
-	if err != nil {
-		return AttemptResult{}, restoreFailedTask(
-			deps,
-			taskID,
-			fmt.Errorf("create run: %w", err),
-		)
-	}
-
+func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Session, run *domain.Run) (AttemptResult, error) {
 	var outputLines []string
 	var outputErr error
 	var progressErr error
@@ -148,7 +159,7 @@ func runClaimedSession(ctx context.Context, deps Deps, taskID int64, session *ag
 		}
 		if progressErr == nil {
 			accumulated := strings.Join(outputLines, "\n")
-			if err := deps.Runs.UpdateProgress(run.ID, accumulated, e.TokensUsed); err != nil {
+			if err := deps.Attempts.UpdateProgress(run.ID, accumulated, e.TokensUsed); err != nil {
 				progressErr = fmt.Errorf("update run progress: %w", err)
 			}
 		}
@@ -164,41 +175,23 @@ func runClaimedSession(ctx context.Context, deps Deps, taskID int64, session *ag
 	result := AttemptResult{}
 	switch outcome.Kind {
 	case agent.Completed:
-		params.RunStatus = domain.RunSucceeded
-		params.ExitReason = domain.ExitCompleted
-		params.TaskStatus = domain.TaskDone
+		params.Outcome = domain.AttemptCompleted
 		params.CommentAuthor = "agent"
 		params.CommentBody = agent.Summary(session)
-		result = AttemptResult{
-			TaskStatus: domain.TaskDone,
-			RunStatus:  domain.RunSucceeded,
-			ExitReason: domain.ExitCompleted,
-		}
+		result = AttemptResult{Outcome: domain.AttemptCompleted}
 
 	case agent.Errored:
 		errMsg := ""
 		if outcome.Err != nil {
 			errMsg = outcome.Err.Error()
 		}
-		params.RunStatus = domain.RunErrored
-		params.ExitReason = domain.ExitAgentError
+		params.Outcome = domain.AttemptAgentError
 		params.Error = errMsg
-		params.TaskStatus = domain.TaskFailed
-		result = AttemptResult{
-			TaskStatus: domain.TaskFailed,
-			RunStatus:  domain.RunErrored,
-			ExitReason: domain.ExitAgentError,
-		}
+		result = AttemptResult{Outcome: domain.AttemptAgentError}
 
 	case agent.TokenBudgetExhausted:
-		params.RunStatus = domain.RunTokenExhausted
-		params.ExitReason = domain.ExitTokenBudgetExhausted
-		params.TaskStatus = domain.TaskFailed
-		result = AttemptResult{
-			TaskStatus: domain.TaskFailed,
-			RunStatus:  domain.RunTokenExhausted,
-			ExitReason: domain.ExitTokenBudgetExhausted,
-		}
+		params.Outcome = domain.AttemptTokenExhausted
+		result = AttemptResult{Outcome: domain.AttemptTokenExhausted}
 
 	default:
 		if runErr == nil {
@@ -207,14 +200,12 @@ func runClaimedSession(ctx context.Context, deps Deps, taskID int64, session *ag
 	}
 
 	if runErr != nil {
-		params.RunStatus = domain.RunErrored
-		params.ExitReason = domain.ExitAgentError
+		params.Outcome = domain.AttemptAgentError
 		params.Error = runErr.Error()
-		params.TaskStatus = domain.TaskFailed
 		result = AttemptResult{}
 	}
 
-	if err := deps.Runs.FinishAttempt(params); err != nil {
+	if err := deps.Attempts.FinishAttempt(params); err != nil {
 		return AttemptResult{}, errors.Join(
 			fmt.Errorf("finish attempt: %w", err),
 			progressErr,
@@ -234,14 +225,4 @@ func runClaimedSession(ctx context.Context, deps Deps, taskID int64, session *ag
 	}
 
 	return result, nil
-}
-
-func restoreFailedTask(deps Deps, taskID int64, cause error) error {
-	if err := deps.Tasks.Transition(taskID, domain.TaskInProgress, domain.TaskFailed); err != nil {
-		return errors.Join(
-			cause,
-			fmt.Errorf("restore task %d to failed: %w", taskID, err),
-		)
-	}
-	return cause
 }

@@ -115,7 +115,7 @@ agent's behavior:
 |---------------|-----------------------------------------------------|
 | `[steps:N]`   | Force the agent plan to have exactly N steps         |
 | `[fail-at:N]` | The agent errors once at step N; resume retries it   |
-| `[budget:N]`  | Override the agent's token budget (default: 3500)    |
+| `[budget:N]`  | Set each attempt's token budget (default: 3500)      |
 
 Directives are composable: `[steps:20] [budget:500]` creates a 20-step task
 that will exhaust its budget partway through.
@@ -137,10 +137,10 @@ Override with `--data-dir` or `AGENT_INBOX_DATA_DIR`.
 
 ```
 cmd/agent-inbox/main.go   CLI entry point, flag parsing, signal handling
-internal/domain/           Types, statuses, transition table, validation
+internal/domain/           Types, statuses, transitions, terminal outcomes
 internal/store/            SQLite persistence (modernc.org/sqlite), migrations
 internal/agent/            Simulated agent: sessions, steps, token budget
-internal/runner/           Claims task, creates run, drives agent, records outcome
+internal/runner/           Prepares sessions, drives attempts, records outcomes
 internal/cli/              One file per command, table rendering
 ```
 
@@ -151,34 +151,41 @@ no uuid lib, no test framework — standard library only beyond the database dri
 
 ### Resume model
 
-A task and an agent session span one or more runs. A run is a single attempt:
-`resume` atomically claims a `failed` task, loads the latest run's session, and
-creates a new run before driving the remaining steps. Earlier runs are append-only,
+A task and an agent session span one or more runs. A run is a single attempt.
+`resume` loads the latest run's session without mutating it, explicitly begins a
+new budget window, then atomically claims the `failed` task and inserts the new
+`running` run before driving the remaining steps. Earlier runs are append-only,
 and `show` groups each run with the output produced by that attempt.
 
-The `failed` to `in_progress` transition is a compare-and-swap update in SQLite.
-If two callers try to resume the same task, exactly one claims it; the other reports
-the status it observes. The same runner interface is used by CLI callers and can be
-reused by an automated caller without duplicating claim or bookkeeping logic.
+Attempt start is one SQLite transaction: it compare-and-swaps the task to
+`in_progress` and inserts the owning run. If either write fails, neither is kept.
+If two callers try to resume the same task, exactly one claims it; the other gets a
+typed conflict containing the status observed by the transaction. Resume also binds
+the claim to the run it loaded, so a fast retry cannot consume the failure produced
+by another concurrent invocation. The same attempt operation is used for initial
+execution and resume.
 
 At the end of an attempt, the run outcome, task transition, and optional success
-comment are committed in one transaction. Invalid combinations such as a succeeded
-run paired with a failed task are rejected before any state is changed.
+comment are committed in one transaction. Callers supply one terminal attempt
+outcome; the run status, exit reason, and task status are derived together by the
+domain model, so inconsistent combinations cannot be supplied.
 
-Manual resume starts a fresh token allowance while preserving unused allowance from
-the prior attempt. A simulated `[fail-at:N]` error is transient: it is consumed when
-first raised, so resume retries the unfinished step. A resumed attempt may still end
-in `failed` (for example, by exhausting its new allowance); that outcome is recorded
-and printed explicitly. As with `run`, a completed attempt that records task failure
-does not make the command itself fail. Rejected or conflicting invocations do return
-a non-zero exit status.
+Loading a session is pure: it preserves configured allowance, remaining allowance,
+attempt usage, and halt state exactly as persisted. Manual resume then explicitly
+starts a fresh window equal to the task's configured `[budget:N]`; both agent-error
+and token-exhaustion retries currently use that policy. A simulated `[fail-at:N]`
+error is transient, so resume retries the unfinished step. A resumed attempt may
+still end in `failed` (for example, by exhausting the configured allowance again);
+that outcome is recorded and printed explicitly. As with `run`, a completed attempt
+that records task failure does not make the command itself fail. Rejected or
+conflicting invocations do return a non-zero exit status.
 
 ## Known limitations
 
 - Token allowance refresh is immediate and manually triggered by `resume`; there is
   no reset schedule or automatic continuation process yet.
-- An interrupted process can leave a task `in_progress`; crash recovery is not part
-  of the manual resume implementation.
+- An interrupted process can leave a task `in_progress`, but its owning `running`
+  run is already durable. Recovery of that attempt is not part of Part 1.
 - Only one task can be in progress at a time; there is no concurrent execution.
 - The simulated agent is deterministic — the same task title and description
   always produce the same plan and step costs.

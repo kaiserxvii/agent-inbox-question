@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/villagelabsco/agent-inbox-question/internal/domain"
 	"github.com/villagelabsco/agent-inbox-question/internal/runner"
@@ -12,19 +11,22 @@ import (
 
 func (a *App) RunWork(ctx context.Context) error {
 	deps := runner.Deps{
-		DataDir: a.DataDir,
-		Tasks:   a.Tasks,
-		Runs:    a.Runs,
-		Output:  os.Stdout,
+		DataDir:  a.DataDir,
+		Tasks:    a.Tasks,
+		Runs:     a.Runs,
+		Attempts: a.Attempts,
+		Output:   a.output(),
+		Options:  a.RunnerOptions,
 	}
+	progress := newOutputPrinter(a.errorOutput())
 
 	var total, succeeded, failed int
 
 	for {
 		select {
 		case <-ctx.Done():
-			printWorkSummary(total, succeeded, failed)
-			return nil
+			printWorkSummary(progress, total, succeeded, failed)
+			return progress.Err()
 		default:
 		}
 
@@ -37,21 +39,21 @@ func (a *App) RunWork(ctx context.Context) error {
 		}
 
 		total++
-		fmt.Fprintf(os.Stderr, ">>> Running task #%d: %s\n", task.ID, task.Title)
+		progress.Printf(">>> Running task #%d: %s\n", task.ID, task.Title)
 
 		err = runner.Execute(ctx, deps, task.ID)
 
 		updated, _ := a.Tasks.Get(task.ID)
 		if updated != nil && updated.Status == domain.TaskDone {
 			succeeded++
-			fmt.Fprintf(os.Stderr, "<<< Task #%d: done\n", task.ID)
+			progress.Printf("<<< Task #%d: done\n", task.ID)
 		} else {
 			failed++
 			status := "unknown"
 			if updated != nil {
 				status = string(updated.Status)
 			}
-			fmt.Fprintf(os.Stderr, "<<< Task #%d: %s\n", task.ID, status)
+			progress.Printf("<<< Task #%d: %s\n", task.ID, status)
 		}
 
 		if err != nil && ctx.Err() != nil {
@@ -59,10 +61,10 @@ func (a *App) RunWork(ctx context.Context) error {
 		}
 	}
 
-	printWorkSummary(total, succeeded, failed)
-	return nil
+	printWorkSummary(progress, total, succeeded, failed)
+	return progress.Err()
 }
 
-func printWorkSummary(total, succeeded, failed int) {
-	fmt.Fprintf(os.Stderr, "\nWork complete: %d tasks processed, %d succeeded, %d failed\n", total, succeeded, failed)
+func printWorkSummary(out *outputPrinter, total, succeeded, failed int) {
+	out.Printf("\nWork complete: %d tasks processed, %d succeeded, %d failed\n", total, succeeded, failed)
 }

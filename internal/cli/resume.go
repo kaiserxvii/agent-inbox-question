@@ -18,22 +18,27 @@ func (a *App) RunResume(ctx context.Context, args []string) error {
 	}
 
 	result, err := runner.Resume(ctx, runner.Deps{
-		DataDir: a.DataDir,
-		Tasks:   a.Tasks,
-		Runs:    a.Runs,
-		Output:  a.output(),
-		NoDelay: a.noDelay,
+		DataDir:  a.DataDir,
+		Tasks:    a.Tasks,
+		Runs:     a.Runs,
+		Attempts: a.Attempts,
+		Output:   a.output(),
+		Options:  a.RunnerOptions,
 	}, id)
 	if err != nil {
 		return err
+	}
+	state, err := result.Outcome.TerminalState()
+	if err != nil {
+		return fmt.Errorf("read resume outcome: %w", err)
 	}
 
 	if _, err := fmt.Fprintf(
 		a.output(),
 		"Task #%d: %s (%s)\n",
 		id,
-		result.TaskStatus,
-		result.ExitReason,
+		state.TaskStatus,
+		state.ExitReason,
 	); err != nil {
 		return fmt.Errorf("write resume result: %w", err)
 	}

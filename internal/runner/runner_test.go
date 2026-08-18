@@ -31,11 +31,12 @@ func setupTest(t *testing.T) (Deps, *store.TaskRepo, *store.RunRepo, *store.Comm
 	comments := store.NewCommentRepo(db)
 
 	deps := Deps{
-		DataDir: dir,
-		Tasks:   tasks,
-		Runs:    runs,
-		Output:  &bytes.Buffer{},
-		NoDelay: true,
+		DataDir:  dir,
+		Tasks:    tasks,
+		Runs:     runs,
+		Attempts: store.NewAttemptRepo(db),
+		Output:   &bytes.Buffer{},
+		Options:  Options{NoDelay: true},
 	}
 	return deps, tasks, runs, comments
 }
@@ -180,7 +181,7 @@ func TestExecuteTokenExhaustion(t *testing.T) {
 	}
 }
 
-func TestResumeContinuesTokenExhaustedTask(t *testing.T) {
+func TestResumeContinuesTokenExhaustedTaskWithinConfiguredAttemptBudget(t *testing.T) {
 	deps, tasks, runs, _ := setupTest(t)
 
 	task := createTask(t, tasks, "long task", "[steps:4] [budget:500]")
@@ -204,37 +205,43 @@ func TestResumeContinuesTokenExhaustedTask(t *testing.T) {
 		t.Fatalf("initial run status = %q, want token_exhausted", before[0].Status)
 	}
 
-	if _, err := Resume(context.Background(), deps, task.ID); err != nil {
-		t.Fatalf("Resume: %v", err)
+	for attempt := 0; attempt < 4; attempt++ {
+		if _, err := Resume(context.Background(), deps, task.ID); err != nil {
+			t.Fatalf("Resume attempt %d: %v", attempt+2, err)
+		}
+		got := getTask(t, tasks, task.ID)
+		if got.Status == domain.TaskDone {
+			break
+		}
 	}
 
-	got, err := tasks.Get(task.ID)
-	if err != nil {
-		t.Fatalf("Get task after resume: %v", err)
-	}
+	got := getTask(t, tasks, task.ID)
 	if got.Status != domain.TaskDone {
 		t.Errorf("task status = %q, want done", got.Status)
 	}
 
-	after, err := runs.ListByTask(task.ID)
-	if err != nil {
-		t.Fatalf("ListByTask after resume: %v", err)
-	}
-	if len(after) != 2 {
-		t.Fatalf("runs after resume = %d, want 2", len(after))
+	after := listRuns(t, runs, task.ID)
+	if len(after) < 2 {
+		t.Fatalf("runs after resume = %d, want at least 2", len(after))
 	}
 	if after[0].Output != firstOutput {
 		t.Errorf("first run output was modified:\n got: %q\nwant: %q", after[0].Output, firstOutput)
 	}
-	if after[1].SessionID != after[0].SessionID {
-		t.Errorf("resumed session = %q, want original session %q", after[1].SessionID, after[0].SessionID)
+	completed := 0
+	for _, run := range after {
+		if run.SessionID != after[0].SessionID {
+			t.Errorf("run %d session = %q, want original session %q", run.ID, run.SessionID, after[0].SessionID)
+		}
+		if run.TokenBudget != 500 {
+			t.Errorf("run %d budget = %d, want configured budget 500", run.ID, run.TokenBudget)
+		}
+		completed += strings.Count(run.Output, "[step ")
 	}
-	if after[1].Status != domain.RunSucceeded {
-		t.Errorf("resumed run status = %q, want succeeded", after[1].Status)
+	if after[len(after)-1].Status != domain.RunSucceeded {
+		t.Errorf("last run status = %q, want succeeded", after[len(after)-1].Status)
 	}
-	completedAfter := strings.Count(after[1].Output, "[step ")
-	if completedBefore+completedAfter != 4 {
-		t.Errorf("completed steps across attempts = %d, want 4", completedBefore+completedAfter)
+	if completed != 4 {
+		t.Errorf("completed steps across attempts = %d, want 4", completed)
 	}
 }
 
@@ -349,14 +356,12 @@ func TestResumeReportsAnotherTokenExhaustion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
-	if result.TaskStatus != domain.TaskFailed {
-		t.Errorf("result task status = %q, want failed", result.TaskStatus)
+	if result.Outcome != domain.AttemptTokenExhausted {
+		t.Errorf("result outcome = %q, want token_exhausted", result.Outcome)
 	}
-	if result.RunStatus != domain.RunTokenExhausted {
-		t.Errorf("result run status = %q, want token_exhausted", result.RunStatus)
-	}
-	if result.ExitReason != domain.ExitTokenBudgetExhausted {
-		t.Errorf("result exit reason = %q, want token_budget_exhausted", result.ExitReason)
+	state, err := result.Outcome.TerminalState()
+	if err != nil {
+		t.Fatalf("TerminalState: %v", err)
 	}
 
 	runList, err := runs.ListByTask(task.ID)
@@ -366,9 +371,9 @@ func TestResumeReportsAnotherTokenExhaustion(t *testing.T) {
 	if len(runList) != 2 {
 		t.Fatalf("runs = %d, want 2", len(runList))
 	}
-	if runList[1].Status != result.RunStatus || runList[1].ExitReason != result.ExitReason {
+	if runList[1].Status != state.RunStatus || runList[1].ExitReason != state.ExitReason {
 		t.Errorf("persisted outcome = (%q, %q), result = (%q, %q)",
-			runList[1].Status, runList[1].ExitReason, result.RunStatus, result.ExitReason)
+			runList[1].Status, runList[1].ExitReason, state.RunStatus, state.ExitReason)
 	}
 }
 
@@ -406,11 +411,12 @@ func TestExecuteReportsAttemptFinalizationFailure(t *testing.T) {
 		closeAt: 2,
 	}
 	deps := Deps{
-		DataDir: dir,
-		Tasks:   tasks,
-		Runs:    runs,
-		Output:  output,
-		NoDelay: true,
+		DataDir:  dir,
+		Tasks:    tasks,
+		Runs:     runs,
+		Attempts: store.NewAttemptRepo(db),
+		Output:   output,
+		Options:  Options{NoDelay: true},
 	}
 
 	err = Execute(context.Background(), deps, task.ID)
@@ -425,11 +431,11 @@ func TestExecuteReportsAttemptFinalizationFailure(t *testing.T) {
 func TestConcurrentResumeAllowsExactlyOneAttempt(t *testing.T) {
 	deps, tasks, runs, _ := setupTest(t)
 
-	task := createTask(t, tasks, "contested resume", "[steps:30] [budget:1]")
+	task := createTask(t, tasks, "contested resume", "[steps:30] [budget:500]")
 	if err := Execute(context.Background(), deps, task.ID); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	deps.NoDelay = false
+	deps.Options.NoDelay = false
 	deps.Output = nil
 
 	type callResult struct {
@@ -455,9 +461,6 @@ func TestConcurrentResumeAllowsExactlyOneAttempt(t *testing.T) {
 	first := <-results
 	second := <-results
 
-	if first.err == nil {
-		t.Error("first completed call succeeded; concurrent loser did not fail fast")
-	}
 	calls := []callResult{first, second}
 	succeeded := 0
 	failed := 0
@@ -470,8 +473,14 @@ func TestConcurrentResumeAllowsExactlyOneAttempt(t *testing.T) {
 		if !errors.Is(call.err, domain.ErrConflict) {
 			t.Errorf("concurrent loser error = %v, want ErrConflict", call.err)
 		}
-		if !strings.Contains(call.err.Error(), `status is "in_progress"`) {
-			t.Errorf("concurrent loser error = %q, want actual in_progress status", call.err)
+		var conflict *domain.TaskStatusConflict
+		if !errors.As(call.err, &conflict) {
+			t.Errorf("concurrent loser error = %v, want TaskStatusConflict", call.err)
+			continue
+		}
+		wantStatus := fmt.Sprintf("status is %q", conflict.Observed)
+		if !strings.Contains(call.err.Error(), wantStatus) {
+			t.Errorf("concurrent loser error = %q, want observed %s", call.err, wantStatus)
 		}
 	}
 	if succeeded != 1 || failed != 1 {

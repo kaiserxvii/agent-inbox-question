@@ -24,6 +24,8 @@ func (a *App) RunAdd(args []string) error {
 		return fmt.Errorf("create task: %w", err)
 	}
 
-	fmt.Println(task.ID)
+	if _, err := fmt.Fprintln(a.output(), task.ID); err != nil {
+		return fmt.Errorf("write task ID: %w", err)
+	}
 	return nil
 }

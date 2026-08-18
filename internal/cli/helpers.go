@@ -8,17 +8,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/villagelabsco/agent-inbox-question/internal/runner"
 	"github.com/villagelabsco/agent-inbox-question/internal/store"
 )
 
 type App struct {
-	DataDir  string
-	DB       *store.DB
-	Tasks    *store.TaskRepo
-	Runs     *store.RunRepo
-	Comments *store.CommentRepo
-	out      io.Writer
-	noDelay  bool
+	DataDir       string
+	DB            *store.DB
+	Tasks         *store.TaskRepo
+	Runs          *store.RunRepo
+	Attempts      *store.AttemptRepo
+	Comments      *store.CommentRepo
+	Stdout        io.Writer
+	Stderr        io.Writer
+	RunnerOptions runner.Options
 }
 
 func NewApp(dataDir string) (*App, error) {
@@ -31,8 +34,10 @@ func NewApp(dataDir string) (*App, error) {
 		DB:       db,
 		Tasks:    store.NewTaskRepo(db),
 		Runs:     store.NewRunRepo(db),
+		Attempts: store.NewAttemptRepo(db),
 		Comments: store.NewCommentRepo(db),
-		out:      os.Stdout,
+		Stdout:   os.Stdout,
+		Stderr:   os.Stderr,
 	}, nil
 }
 
@@ -41,10 +46,17 @@ func (a *App) Close() error {
 }
 
 func (a *App) output() io.Writer {
-	if a.out != nil {
-		return a.out
+	if a.Stdout != nil {
+		return a.Stdout
 	}
 	return os.Stdout
+}
+
+func (a *App) errorOutput() io.Writer {
+	if a.Stderr != nil {
+		return a.Stderr
+	}
+	return os.Stderr
 }
 
 type outputPrinter struct {
@@ -110,7 +122,7 @@ func padRight(s string, width int) string {
 	return s + strings.Repeat(" ", width-len(s))
 }
 
-func printTable(headers []string, rows [][]string) {
+func printTable(writer io.Writer, headers []string, rows [][]string) error {
 	widths := make([]int, len(headers))
 	for i, h := range headers {
 		widths[i] = len(h)
@@ -133,8 +145,9 @@ func printTable(headers []string, rows [][]string) {
 		header.WriteString(padRight(h, widths[i]))
 		sep.WriteString(strings.Repeat("-", widths[i]))
 	}
-	fmt.Println(header.String())
-	fmt.Println(sep.String())
+	out := newOutputPrinter(writer)
+	out.Println(header.String())
+	out.Println(sep.String())
 
 	for _, row := range rows {
 		var line strings.Builder
@@ -148,6 +161,7 @@ func printTable(headers []string, rows [][]string) {
 				line.WriteString(col)
 			}
 		}
-		fmt.Println(line.String())
+		out.Println(line.String())
 	}
+	return out.Err()
 }

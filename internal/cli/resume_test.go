@@ -26,18 +26,19 @@ func TestRunResumeReportsRecordedFailure(t *testing.T) {
 		t.Fatalf("Create task: %v", err)
 	}
 	deps := runner.Deps{
-		DataDir: app.DataDir,
-		Tasks:   app.Tasks,
-		Runs:    app.Runs,
-		NoDelay: true,
+		DataDir:  app.DataDir,
+		Tasks:    app.Tasks,
+		Runs:     app.Runs,
+		Attempts: app.Attempts,
+		Options:  runner.Options{NoDelay: true},
 	}
 	if err := runner.Execute(context.Background(), deps, task.ID); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 
 	var output bytes.Buffer
-	app.out = &output
-	app.noDelay = true
+	app.Stdout = &output
+	app.RunnerOptions = runner.Options{NoDelay: true}
 	if err := app.RunResume(context.Background(), []string{fmt.Sprint(task.ID)}); err != nil {
 		t.Fatalf("RunResume: %v", err)
 	}

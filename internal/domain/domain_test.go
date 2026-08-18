@@ -62,3 +62,37 @@ func TestParseTaskStatus(t *testing.T) {
 		t.Error("ParseTaskStatus(bogus) should fail")
 	}
 }
+
+func TestAttemptOutcomeDeterminesEveryTerminalStatus(t *testing.T) {
+	tests := []struct {
+		outcome    AttemptOutcome
+		runStatus  RunStatus
+		exitReason ExitReason
+		taskStatus TaskStatus
+	}{
+		{AttemptCompleted, RunSucceeded, ExitCompleted, TaskDone},
+		{AttemptAgentError, RunErrored, ExitAgentError, TaskFailed},
+		{AttemptTokenExhausted, RunTokenExhausted, ExitTokenBudgetExhausted, TaskFailed},
+	}
+
+	for _, test := range tests {
+		state, err := test.outcome.TerminalState()
+		if err != nil {
+			t.Fatalf("TerminalState(%q): %v", test.outcome, err)
+		}
+		if state.RunStatus != test.runStatus ||
+			state.ExitReason != test.exitReason ||
+			state.TaskStatus != test.taskStatus {
+			t.Errorf(
+				"TerminalState(%q) = (%q, %q, %q), want (%q, %q, %q)",
+				test.outcome,
+				state.RunStatus,
+				state.ExitReason,
+				state.TaskStatus,
+				test.runStatus,
+				test.exitReason,
+				test.taskStatus,
+			)
+		}
+	}
+}

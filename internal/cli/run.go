@@ -18,11 +18,12 @@ func (a *App) RunRun(ctx context.Context, args []string) error {
 	}
 
 	deps := runner.Deps{
-		DataDir: a.DataDir,
-		Tasks:   a.Tasks,
-		Runs:    a.Runs,
-		Output:  a.output(),
-		NoDelay: a.noDelay,
+		DataDir:  a.DataDir,
+		Tasks:    a.Tasks,
+		Runs:     a.Runs,
+		Attempts: a.Attempts,
+		Output:   a.output(),
+		Options:  a.RunnerOptions,
 	}
 
 	return runner.Execute(ctx, deps, id)

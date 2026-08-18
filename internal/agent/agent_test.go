@@ -46,8 +46,8 @@ func TestDirectiveParsing(t *testing.T) {
 	if len(s.state.Steps) != 3 {
 		t.Errorf("steps = %d, want 3", len(s.state.Steps))
 	}
-	if s.state.TokenBudget != 500 {
-		t.Errorf("budget = %d, want 500", s.state.TokenBudget)
+	if s.ConfiguredBudget() != 500 {
+		t.Errorf("configured budget = %d, want 500", s.ConfiguredBudget())
 	}
 }
 
@@ -236,6 +236,76 @@ func TestLoadAndContinue(t *testing.T) {
 		if outcome2.Kind != TokenBudgetExhausted {
 			t.Errorf("expected more steps completed or another exhaustion, got outcome %d", outcome2.Kind)
 		}
+	}
+}
+
+func TestLoadPreservesAttemptBudgetState(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	session, err := Start(dir, "t", "[steps:1] [budget:1]", nil, WithNoDelay())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := session.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	wantBudget := session.AttemptAllowance()
+	wantRemaining := session.RemainingBudget()
+	wantTokensUsed := session.TokensUsed()
+	wantSummary := Summary(session)
+
+	loaded, err := Load(dir, session.ID(), WithNoDelay())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.AttemptAllowance() != wantBudget {
+		t.Errorf("loaded allowance = %d, want preserved allowance %d", loaded.AttemptAllowance(), wantBudget)
+	}
+	if loaded.TokensUsed() != wantTokensUsed {
+		t.Errorf("loaded tokens used = %d, want preserved usage %d", loaded.TokensUsed(), wantTokensUsed)
+	}
+	if loaded.RemainingBudget() != wantRemaining {
+		t.Errorf("loaded remaining budget = %d, want %d", loaded.RemainingBudget(), wantRemaining)
+	}
+	if got := Summary(loaded); got != wantSummary {
+		t.Errorf("loaded summary = %q, want preserved state summary %q", got, wantSummary)
+	}
+}
+
+func TestBeginAttemptUsesExplicitAllowanceWithoutChangingConfiguredBudget(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	session, err := Start(dir, "t", "[steps:10] [budget:400]", nil, WithNoDelay())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := session.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if session.TokensUsed() == 0 {
+		t.Fatal("fixture used no tokens before exhaustion")
+	}
+
+	if err := session.BeginAttempt(250); err != nil {
+		t.Fatalf("BeginAttempt: %v", err)
+	}
+	if session.ConfiguredBudget() != 400 {
+		t.Errorf("configured budget = %d, want 400", session.ConfiguredBudget())
+	}
+	if session.AttemptAllowance() != 250 {
+		t.Errorf("attempt allowance = %d, want 250", session.AttemptAllowance())
+	}
+	if session.RemainingBudget() != 250 {
+		t.Errorf("remaining budget = %d, want 250", session.RemainingBudget())
+	}
+	if session.TokensUsed() != 0 {
+		t.Errorf("attempt usage = %d, want 0", session.TokensUsed())
 	}
 }
 

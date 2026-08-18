@@ -28,10 +28,11 @@ func TestRunShowDisplaysOutputForEveryAttempt(t *testing.T) {
 		t.Fatalf("Create task: %v", err)
 	}
 	deps := runner.Deps{
-		DataDir: app.DataDir,
-		Tasks:   app.Tasks,
-		Runs:    app.Runs,
-		NoDelay: true,
+		DataDir:  app.DataDir,
+		Tasks:    app.Tasks,
+		Runs:     app.Runs,
+		Attempts: app.Attempts,
+		Options:  runner.Options{NoDelay: true},
 	}
 	if err := runner.Execute(context.Background(), deps, task.ID); err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -49,7 +50,7 @@ func TestRunShowDisplaysOutputForEveryAttempt(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	app.out = &output
+	app.Stdout = &output
 	if err := app.RunShow([]string{strconv.FormatInt(task.ID, 10)}); err != nil {
 		t.Fatalf("RunShow: %v", err)
 	}
@@ -94,7 +95,7 @@ func TestRunShowReportsUnavailableHistory(t *testing.T) {
 	}
 
 	output := &closingWriter{close: app.Close}
-	app.out = output
+	app.Stdout = output
 	err = app.RunShow([]string{strconv.FormatInt(task.ID, 10)})
 	if err == nil {
 		t.Fatal("RunShow returned nil, want history query error")
@@ -125,7 +126,7 @@ func TestRunShowReportsOutputFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create task: %v", err)
 	}
-	app.out = failingWriter{}
+	app.Stdout = failingWriter{}
 
 	err = app.RunShow([]string{strconv.FormatInt(task.ID, 10)})
 	if err == nil {
