@@ -331,7 +331,10 @@ func TestRunFencedDoesNotExecuteAfterOwnershipIsLost(t *testing.T) {
 	_, err = session.RunFenced(
 		context.Background(),
 		func() error { return domain.ErrLeaseLost },
-		func(Event) { executed++ },
+		func(Event) error {
+			executed++
+			return nil
+		},
 	)
 	if !errors.Is(err, domain.ErrLeaseLost) {
 		t.Fatalf("RunFenced error = %v, want ErrLeaseLost", err)

@@ -816,16 +816,19 @@ func TestLeaseTakeoverFencesPausedExecutorSubprocess(t *testing.T) {
 
 	readyPath := filepath.Join(deps.DataDir, "takeover-ready")
 	waitForFile(t, readyPath, time.Second, "paused executor readiness")
+	waitForFile(
+		t,
+		filepath.Join(deps.DataDir, "takeover-authorized"),
+		time.Second,
+		"old executor authorization",
+	)
 	if err := command.Process.Signal(syscall.SIGSTOP); err != nil {
 		t.Fatalf("pause old executor: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(deps.DataDir, "takeover-go"), nil, 0o644); err != nil {
-		t.Fatalf("release marker: %v", err)
 	}
 
 	time.Sleep(300 * time.Millisecond)
 	takeoverAt := time.Now().UTC()
-	expired, err := deps.Attempts.NextExpired(takeoverAt)
+	expired, err := deps.Attempts.NextExpired()
 	if err != nil {
 		t.Fatalf("NextExpired: %v", err)
 	}
@@ -837,6 +840,9 @@ func TestLeaseTakeoverFencesPausedExecutorSubprocess(t *testing.T) {
 		t.Fatalf("Resume takeover: %v", err)
 	}
 
+	if err := os.WriteFile(filepath.Join(deps.DataDir, "takeover-go"), nil, 0o644); err != nil {
+		t.Fatalf("release marker: %v", err)
+	}
 	if err := command.Process.Signal(syscall.SIGCONT); err != nil {
 		t.Fatalf("resume old executor: %v", err)
 	}
@@ -904,7 +910,6 @@ func TestLeaseTakeoverHelper(t *testing.T) {
 	if err := attempts.UpdateProgress(store.AttemptProgress{
 		RunID:      run.ID,
 		OwnerToken: run.OwnerToken,
-		ObservedAt: time.Now().UTC(),
 		Checkpoint: checkpoint,
 	}); err != nil {
 		t.Fatalf("publish initial checkpoint: %v", err)
@@ -912,12 +917,32 @@ func TestLeaseTakeoverHelper(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, "takeover-ready"), nil, 0o644); err != nil {
 		t.Fatalf("write ready marker: %v", err)
 	}
-	waitForFile(t, filepath.Join(dataDir, "takeover-go"), 5*time.Second, "takeover release")
 	executed := 0
 	_, err = session.RunFenced(context.Background(), func() error {
-		return attempts.RenewLease(run.ID, run.OwnerToken, time.Now().UTC(), 200*time.Millisecond)
-	}, func(agent.Event) {
+		if err := attempts.RenewLease(run.ID, run.OwnerToken, 200*time.Millisecond); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dataDir, "takeover-authorized"), nil, 0o644); err != nil {
+			return err
+		}
+		waitForFile(t, filepath.Join(dataDir, "takeover-go"), 5*time.Second, "takeover release")
+		return nil
+	}, func(event agent.Event) error {
+		checkpoint, err := session.Checkpoint()
+		if err != nil {
+			return err
+		}
+		if err := attempts.UpdateProgress(store.AttemptProgress{
+			RunID:      run.ID,
+			OwnerToken: run.OwnerToken,
+			Output:     event.Output,
+			TokensUsed: event.TokensUsed,
+			Checkpoint: checkpoint,
+		}); err != nil {
+			return err
+		}
 		executed++
+		return nil
 	})
 	result := fmt.Sprintf("unexpected:%d", executed)
 	if errors.Is(err, domain.ErrLeaseLost) {

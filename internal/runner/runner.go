@@ -59,6 +59,38 @@ type attemptTerminalization struct {
 	commentBody   string
 }
 
+func restoreAttemptSession(
+	dataDir string,
+	sessionID string,
+	checkpoint string,
+	opts ...agent.Option,
+) (*agent.Session, error) {
+	if checkpoint != "" {
+		return agent.Restore(dataDir, checkpoint, opts...)
+	}
+	return agent.Load(dataDir, sessionID, opts...)
+}
+
+func bindOwnedSession(
+	deps Deps,
+	session *agent.Session,
+	run *domain.Run,
+) error {
+	if err := session.BindAttempt(run.ID, run.OwnerToken); err != nil {
+		return err
+	}
+	checkpoint, err := session.Checkpoint()
+	if err != nil {
+		return err
+	}
+	return deps.Attempts.UpdateProgress(store.AttemptProgress{
+		RunID:      run.ID,
+		OwnerToken: run.OwnerToken,
+		TokensUsed: session.TokensUsed(),
+		Checkpoint: checkpoint,
+	})
+}
+
 func terminalizeCheckpoint(
 	session *agent.Session,
 	checkpoint agent.AttemptCheckpoint,
@@ -107,13 +139,11 @@ func RecoverExpired(
 	resetInterval time.Duration,
 	now time.Time,
 ) error {
-	var session *agent.Session
-	var err error
-	if run.SessionCheckpoint != "" {
-		session, err = agent.Restore(deps.DataDir, run.SessionCheckpoint)
-	} else {
-		session, err = agent.Load(deps.DataDir, run.SessionID)
-	}
+	session, err := restoreAttemptSession(
+		deps.DataDir,
+		run.SessionID,
+		run.SessionCheckpoint,
+	)
 	if err != nil {
 		return fmt.Errorf("load expired run session: %w", err)
 	}
@@ -163,7 +193,6 @@ func RecoverExpired(
 		CommentAuthor:     terminal.commentAuthor,
 		CommentBody:       terminal.commentBody,
 		FinishedAt:        now,
-		LeaseCheckedAt:    now,
 		SessionCheckpoint: sessionCheckpoint,
 	}
 
@@ -204,7 +233,7 @@ func Execute(ctx context.Context, deps Deps, taskID int64) error {
 	if err != nil {
 		return fmt.Errorf("start attempt for task %d: %w", taskID, err)
 	}
-	if err := session.BindAttempt(run.ID, run.OwnerToken); err != nil {
+	if err := bindOwnedSession(deps, session, run); err != nil {
 		return fmt.Errorf("bind agent session to run %d: %w", run.ID, err)
 	}
 
@@ -259,14 +288,12 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 	if deps.Options.NoDelay {
 		opts = append(opts, agent.WithNoDelay())
 	}
-	if candidate.SessionCheckpoint == "" {
-		return AttemptResult{}, fmt.Errorf(
-			"task %d cannot resume run %d without a session checkpoint",
-			taskID,
-			candidate.RunID,
-		)
-	}
-	session, err := agent.Restore(deps.DataDir, candidate.SessionCheckpoint, opts...)
+	session, err := restoreAttemptSession(
+		deps.DataDir,
+		candidate.SessionID,
+		candidate.SessionCheckpoint,
+		opts...,
+	)
 	if err != nil {
 		return AttemptResult{}, fmt.Errorf("load agent session: %w", err)
 	}
@@ -315,7 +342,7 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 		}
 		return AttemptResult{}, fmt.Errorf("start resumed attempt for task %d: %w", taskID, err)
 	}
-	if err := session.BindAttempt(run.ID, run.OwnerToken); err != nil {
+	if err := bindOwnedSession(deps, session, run); err != nil {
 		return AttemptResult{}, fmt.Errorf("bind resumed session to run %d: %w", run.ID, err)
 	}
 
@@ -331,7 +358,6 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 	startStep := session.CompletedSteps()
 	var outputLines []string
 	var outputErr error
-	var progressErr error
 	leaseDuration := deps.Options.LeaseDuration
 	if leaseDuration <= 0 {
 		leaseDuration = defaultLeaseDuration
@@ -340,38 +366,34 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 		return deps.Attempts.RenewLease(
 			run.ID,
 			run.OwnerToken,
-			time.Now().UTC(),
 			leaseDuration,
 		)
-	}, func(e agent.Event) {
-		outputLines = append(outputLines, e.Output)
+	}, func(e agent.Event) error {
+		checkpoint, err := session.Checkpoint()
+		if err != nil {
+			cancel()
+			return err
+		}
+		accumulatedLines := append(append([]string(nil), outputLines...), e.Output)
+		if err := deps.Attempts.UpdateProgress(store.AttemptProgress{
+			RunID:      run.ID,
+			OwnerToken: run.OwnerToken,
+			Output:     strings.Join(accumulatedLines, "\n"),
+			TokensUsed: e.TokensUsed,
+			Checkpoint: checkpoint,
+		}); err != nil {
+			if errors.Is(err, domain.ErrLeaseLost) {
+				cancel()
+			}
+			return fmt.Errorf("update run progress: %w", err)
+		}
+		outputLines = accumulatedLines
 		if deps.Output != nil && outputErr == nil {
 			if _, err := fmt.Fprintln(deps.Output, e.Output); err != nil {
 				outputErr = fmt.Errorf("write attempt output: %w", err)
 			}
 		}
-		if progressErr == nil {
-			accumulated := strings.Join(outputLines, "\n")
-			checkpoint, err := session.Checkpoint()
-			if err != nil {
-				progressErr = err
-				cancel()
-				return
-			}
-			if err := deps.Attempts.UpdateProgress(store.AttemptProgress{
-				RunID:      run.ID,
-				OwnerToken: run.OwnerToken,
-				ObservedAt: time.Now().UTC(),
-				Output:     accumulated,
-				TokensUsed: e.TokensUsed,
-				Checkpoint: checkpoint,
-			}); err != nil {
-				progressErr = fmt.Errorf("update run progress: %w", err)
-				if errors.Is(err, domain.ErrLeaseLost) {
-					cancel()
-				}
-			}
-		}
+		return nil
 	})
 	cancel()
 	if leaseErr := <-leaseErrors; leaseErr != nil {
@@ -380,7 +402,6 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 	if runErr != nil {
 		return AttemptResult{}, errors.Join(
 			fmt.Errorf("run agent session: %w", runErr),
-			progressErr,
 			outputErr,
 		)
 	}
@@ -398,7 +419,6 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 		TokensUsed:        session.TokensUsed(),
 		SessionCheckpoint: checkpoint,
 	}
-	params.LeaseCheckedAt = time.Now().UTC()
 	finishedAt := time.Now().UTC()
 	if deps.Options.Now != nil {
 		finishedAt = deps.Options.Now().UTC()
@@ -428,7 +448,6 @@ func runAttempt(ctx context.Context, deps Deps, taskID int64, session *agent.Ses
 	if err := deps.Attempts.FinishAttempt(params); err != nil {
 		return AttemptResult{}, errors.Join(
 			fmt.Errorf("finish attempt: %w", err),
-			progressErr,
 			outputErr,
 		)
 	}
@@ -483,8 +502,8 @@ func renewLease(
 		case <-ctx.Done():
 			renewal.result <- nil
 			return
-		case now := <-ticker.C:
-			if err := deps.Attempts.RenewLease(run.ID, run.OwnerToken, now.UTC(), duration); err != nil {
+		case <-ticker.C:
+			if err := deps.Attempts.RenewLease(run.ID, run.OwnerToken, duration); err != nil {
 				renewal.cancel()
 				renewal.result <- fmt.Errorf("renew attempt lease: %w", err)
 				return

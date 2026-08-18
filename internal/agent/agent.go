@@ -283,18 +283,29 @@ func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
 }
 
 func (s *Session) Run(ctx context.Context, onEvent func(Event)) (Outcome, error) {
-	return s.run(ctx, nil, onEvent)
+	var observe func(Event) error
+	if onEvent != nil {
+		observe = func(event Event) error {
+			onEvent(event)
+			return nil
+		}
+	}
+	return s.run(ctx, nil, observe)
 }
 
-// RunFenced verifies ownership immediately before every simulated step. A
-// failed fence returns without mutating or persisting that step.
+// RunFenced verifies ownership before each step and commits the simulated side
+// effect through onEvent. A rejected commit rolls the in-memory step back and
+// never writes it to the compatibility session file.
 func (s *Session) RunFenced(
 	ctx context.Context,
 	fence func() error,
-	onEvent func(Event),
+	onEvent func(Event) error,
 ) (Outcome, error) {
 	if fence == nil {
 		return Outcome{}, errors.New("step fence is required")
+	}
+	if onEvent == nil {
+		return Outcome{}, errors.New("fenced step sink is required")
 	}
 	return s.run(ctx, fence, onEvent)
 }
@@ -302,7 +313,7 @@ func (s *Session) RunFenced(
 func (s *Session) run(
 	ctx context.Context,
 	fence func() error,
-	onEvent func(Event),
+	onEvent func(Event) error,
 ) (Outcome, error) {
 	failAt := -1
 	if s.state.ErroredAt > 0 {
@@ -367,43 +378,76 @@ func (s *Session) run(
 			}
 		}
 
+		previous := cloneState(s.state)
 		step.Output = fmt.Sprintf("[step %d/%d] %s: processed", stepIdx, len(s.state.Steps), step.Name)
 		step.Done = true
 		s.state.TokensUsed += step.TokenCost
 		s.state.TokensRemaining -= step.TokenCost
 		s.state.NextStep++
 
-		if err := s.persist(); err != nil {
-			return Outcome{}, fmt.Errorf("persist session: %w", err)
+		event := Event{
+			Step:       stepIdx,
+			StepName:   step.Name,
+			Output:     step.Output,
+			TokensUsed: s.state.TokensUsed,
 		}
-
-		if onEvent != nil {
-			onEvent(Event{
-				Step:       stepIdx,
-				StepName:   step.Name,
-				Output:     step.Output,
-				TokensUsed: s.state.TokensUsed,
-			})
+		if fence != nil {
+			if err := onEvent(event); err != nil {
+				s.state = previous
+				return Outcome{}, err
+			}
+			if err := s.persist(); err != nil {
+				return Outcome{}, fmt.Errorf("persist fenced session: %w", err)
+			}
+		} else {
+			if err := s.persist(); err != nil {
+				return Outcome{}, fmt.Errorf("persist session: %w", err)
+			}
+			if onEvent != nil {
+				if err := onEvent(event); err != nil {
+					return Outcome{}, err
+				}
+			}
 		}
 	}
 
+	previous := cloneState(s.state)
 	s.state.Completed = true
 	s.state.AttemptHaltReason = HaltCompleted
-	if err := s.persist(); err != nil {
-		return Outcome{}, fmt.Errorf("persist completed session: %w", err)
-	}
-
 	summary := fmt.Sprintf("completed all %d steps for: %s", len(s.state.Steps), s.state.TaskTitle)
-	if onEvent != nil {
-		onEvent(Event{
-			Step:       len(s.state.Steps),
-			StepName:   "summary",
-			Output:     summary,
-			TokensUsed: s.state.TokensUsed,
-		})
+	event := Event{
+		Step:       len(s.state.Steps),
+		StepName:   "summary",
+		Output:     summary,
+		TokensUsed: s.state.TokensUsed,
+	}
+	if fence != nil {
+		if err := onEvent(event); err != nil {
+			s.state = previous
+			return Outcome{}, err
+		}
+		if err := s.persist(); err != nil {
+			return Outcome{}, fmt.Errorf("persist fenced completion: %w", err)
+		}
+	} else {
+		if err := s.persist(); err != nil {
+			return Outcome{}, fmt.Errorf("persist completed session: %w", err)
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return Outcome{}, err
+			}
+		}
 	}
 
 	return Outcome{Kind: Completed}, nil
+}
+
+func cloneState(state SessionState) SessionState {
+	cloned := state
+	cloned.Feedback = append([]string(nil), state.Feedback...)
+	cloned.Steps = append([]Step(nil), state.Steps...)
+	return cloned
 }
 
 func (s *Session) persist() error {

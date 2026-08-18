@@ -306,7 +306,6 @@ func TestAttemptLifecycle(t *testing.T) {
 	if err := attempts.UpdateProgress(AttemptProgress{
 		RunID:      run.ID,
 		OwnerToken: run.OwnerToken,
-		ObservedAt: time.Now().UTC(),
 		Output:     "partial output",
 		TokensUsed: 300,
 	}); err != nil {
@@ -458,7 +457,7 @@ func TestStartAttemptAtomicallyRejectsResumeBeforeProviderReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	first, err := attempts.StartOwnedAttempt(StartAttemptParams{
 		TaskID:         task.ID,
 		ExpectedStatus: domain.TaskTodo,
@@ -471,12 +470,11 @@ func TestStartAttemptAtomicallyRejectsResumeBeforeProviderReset(t *testing.T) {
 		t.Fatalf("StartOwnedAttempt: %v", err)
 	}
 	if err := attempts.FinishAttempt(FinishAttemptParams{
-		RunID:          first.ID,
-		TaskID:         task.ID,
-		OwnerToken:     first.OwnerToken,
-		Completion:     completionForTest(t, domain.AttemptTokenExhausted, now, time.Hour, true),
-		FinishedAt:     now,
-		LeaseCheckedAt: now,
+		RunID:      first.ID,
+		TaskID:     task.ID,
+		OwnerToken: first.OwnerToken,
+		Completion: completionForTest(t, domain.AttemptTokenExhausted, now, time.Hour, true),
+		FinishedAt: now,
 	}); err != nil {
 		t.Fatalf("FinishAttempt: %v", err)
 	}
@@ -802,7 +800,6 @@ func TestStaleAttemptOwnerCannotPublishProgress(t *testing.T) {
 	err = attempts.UpdateProgress(AttemptProgress{
 		RunID:      run.ID,
 		OwnerToken: "stale-owner-token",
-		ObservedAt: time.Now().UTC(),
 		Output:     "should not be stored",
 		TokensUsed: 100,
 	})
@@ -819,6 +816,58 @@ func TestStaleAttemptOwnerCannotPublishProgress(t *testing.T) {
 	}
 }
 
+func TestExpiredOwnerCannotRenewPublishOrFinalize(t *testing.T) {
+	db := openTestDB(t)
+	tasks := NewTaskRepo(db)
+	attempts := NewAttemptRepo(db)
+	runs := NewRunRepo(db)
+
+	task, err := tasks.Create("expired owner", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	run, err := attempts.StartOwnedAttempt(StartAttemptParams{
+		TaskID:         task.ID,
+		ExpectedStatus: domain.TaskTodo,
+		SessionID:      "session",
+		TokenBudget:    1000,
+		StartedAt:      time.Now().UTC().Add(-time.Hour),
+		LeaseDuration:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("StartOwnedAttempt: %v", err)
+	}
+
+	if err := attempts.RenewLease(run.ID, run.OwnerToken, time.Minute); !errors.Is(err, domain.ErrLeaseLost) {
+		t.Errorf("RenewLease error = %v, want ErrLeaseLost", err)
+	}
+	if err := attempts.UpdateProgress(AttemptProgress{
+		RunID:      run.ID,
+		OwnerToken: run.OwnerToken,
+		Output:     "stale output",
+		Checkpoint: `{"next_step":1}`,
+	}); !errors.Is(err, domain.ErrLeaseLost) {
+		t.Errorf("UpdateProgress error = %v, want ErrLeaseLost", err)
+	}
+	completion := completionForTest(t, domain.AttemptCompleted, time.Time{}, 0, false)
+	if err := attempts.FinishAttempt(FinishAttemptParams{
+		RunID:      run.ID,
+		TaskID:     task.ID,
+		OwnerToken: run.OwnerToken,
+		Completion: completion,
+	}); !errors.Is(err, domain.ErrLeaseLost) {
+		t.Errorf("FinishAttempt error = %v, want ErrLeaseLost", err)
+	}
+
+	stored, err := runs.LatestByTask(task.ID)
+	if err != nil {
+		t.Fatalf("LatestByTask: %v", err)
+	}
+	if stored.Status != domain.RunRunning || stored.Output != "" || stored.SessionCheckpoint != "" {
+		t.Errorf("expired owner changed run: %#v", stored)
+	}
+}
+
 func TestStaleAttemptCannotRewindSuccessorCheckpoint(t *testing.T) {
 	db := openTestDB(t)
 	tasks := NewTaskRepo(db)
@@ -829,14 +878,14 @@ func TestStaleAttemptCannotRewindSuccessorCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	first, err := attempts.StartOwnedAttempt(StartAttemptParams{
 		TaskID:         task.ID,
 		ExpectedStatus: domain.TaskTodo,
 		SessionID:      "session",
 		TokenBudget:    1000,
 		StartedAt:      now,
-		LeaseDuration:  time.Minute,
+		LeaseDuration:  100 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("start first attempt: %v", err)
@@ -844,18 +893,17 @@ func TestStaleAttemptCannotRewindSuccessorCheckpoint(t *testing.T) {
 	if err := attempts.UpdateProgress(AttemptProgress{
 		RunID:      first.ID,
 		OwnerToken: first.OwnerToken,
-		ObservedAt: now.Add(30 * time.Second),
 		Checkpoint: `{"next_step":1}`,
 	}); err != nil {
 		t.Fatalf("publish first checkpoint: %v", err)
 	}
-	takeoverAt := now.Add(time.Minute)
+	time.Sleep(150 * time.Millisecond)
+	takeoverAt := time.Now().UTC()
 	if err := attempts.RecoverExpiredAttempt(FinishAttemptParams{
-		RunID:          first.ID,
-		TaskID:         task.ID,
-		Completion:     completionForTest(t, domain.AttemptInterrupted, time.Time{}, 0, false),
-		FinishedAt:     takeoverAt,
-		LeaseCheckedAt: takeoverAt,
+		RunID:      first.ID,
+		TaskID:     task.ID,
+		Completion: completionForTest(t, domain.AttemptInterrupted, time.Time{}, 0, false),
+		FinishedAt: takeoverAt,
 	}); err != nil {
 		t.Fatalf("recover first attempt: %v", err)
 	}
@@ -875,7 +923,6 @@ func TestStaleAttemptCannotRewindSuccessorCheckpoint(t *testing.T) {
 	if err := attempts.UpdateProgress(AttemptProgress{
 		RunID:      second.ID,
 		OwnerToken: second.OwnerToken,
-		ObservedAt: takeoverAt.Add(time.Second),
 		Checkpoint: activeCheckpoint,
 	}); err != nil {
 		t.Fatalf("publish successor checkpoint: %v", err)
@@ -884,7 +931,6 @@ func TestStaleAttemptCannotRewindSuccessorCheckpoint(t *testing.T) {
 	err = attempts.UpdateProgress(AttemptProgress{
 		RunID:      first.ID,
 		OwnerToken: first.OwnerToken,
-		ObservedAt: takeoverAt.Add(time.Second),
 		Checkpoint: `{"next_step":1}`,
 	})
 	if !errors.Is(err, domain.ErrLeaseLost) {

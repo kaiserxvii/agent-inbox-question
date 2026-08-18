@@ -176,10 +176,12 @@ expose a partially evolved schema.
 A task and an agent session span one or more runs. A run is a single attempt.
 `resume` snapshots the task status, continuation decision, and latest terminal
 run in one database statement. It restores that run's authoritative SQLite
-checkpoint, explicitly begins a new budget window, then atomically claims the
-`failed` task and inserts the new `running` run before driving the remaining
-steps. A running run is never accepted as a resume predecessor. Earlier runs are
-append-only, and `show` groups each run with the output produced by that attempt.
+checkpoint, falling back to the Part 1 session file only when an upgraded run has
+no checkpoint. It explicitly begins a new budget window, then atomically claims
+the `failed` task and inserts the new `running` run before driving the remaining
+steps. Binding immediately publishes the restored state into the new run, so the
+compatibility file stops being authoritative. A running run is never accepted as
+a resume predecessor.
 
 Attempt start is one SQLite transaction: it compare-and-swaps the task to
 `in_progress` and inserts the owning run. If either write fails, neither is kept.
@@ -235,9 +237,11 @@ returned as operational errors; they are not mislabeled as agent errors.
 
 Every running run owns a cryptographically random token and a renewable three-
 second lease; executors renew once per second and fence immediately before every
-step. Renewal, checkpoint publication, progress publication, and finalization are
-all guarded by run ID, owner token, and lease validity. If an owner loses its
-lease, it cannot execute another step. Task claims and run creation remain one
+step. SQLite evaluates lease validity against its own current time and calculates
+renewal expiry from that same value; callers never provide an authorization time.
+The fenced SQLite checkpoint write is the simulated step's commit point. If it
+rejects a stale owner, the in-memory step is rolled back before it reaches the
+compatibility file or output stream. Task claims and run creation remain one
 SQLite compare-and-swap transaction, which also resolves races between `serve`
 and human commands.
 

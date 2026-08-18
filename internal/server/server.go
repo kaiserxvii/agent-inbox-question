@@ -96,7 +96,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 
 		now := s.clock.Now()
-		expired, err := s.deps.Attempts.NextExpired(now)
+		expired, err := s.deps.Attempts.NextExpired()
 		if err == nil {
 			if err := runner.RecoverExpired(
 				runner.Deps{

@@ -42,7 +42,6 @@ type FinishAttemptParams struct {
 	CommentAuthor     string
 	CommentBody       string
 	FinishedAt        time.Time
-	LeaseCheckedAt    time.Time
 	SessionCheckpoint string
 	Completion        domain.AttemptCompletion
 }
@@ -61,29 +60,21 @@ type StartAttemptParams struct {
 type AttemptProgress struct {
 	RunID      int64
 	OwnerToken string
-	ObservedAt time.Time
 	Output     string
 	TokensUsed int
 	Checkpoint string
 }
 
-type finishAuthorization func(FinishAttemptParams, time.Time) (string, []any)
+type finishAuthorization func(FinishAttemptParams) (string, []any)
 
-func ownerFinishAuthorization(
-	params FinishAttemptParams,
-	leaseCheckedAt time.Time,
-) (string, []any) {
-	return "owner_token = ? AND lease_expires_at > ?", []any{
+func ownerFinishAuthorization(params FinishAttemptParams) (string, []any) {
+	return "owner_token = ? AND julianday(lease_expires_at) > julianday('now')", []any{
 		params.OwnerToken,
-		leaseCheckedAt.Format(time.RFC3339Nano),
 	}
 }
 
-func expiredFinishAuthorization(
-	_ FinishAttemptParams,
-	leaseCheckedAt time.Time,
-) (string, []any) {
-	return "lease_expires_at <= ?", []any{leaseCheckedAt.Format(time.RFC3339Nano)}
+func expiredFinishAuthorization(_ FinishAttemptParams) (string, []any) {
+	return "julianday(lease_expires_at) <= julianday('now')", nil
 }
 
 func NewAttemptRepo(db *DB) *AttemptRepo {
@@ -167,14 +158,14 @@ func (r *AttemptRepo) GetResumeCandidate(taskID int64) (*ResumeCandidate, error)
 func (r *AttemptRepo) UpdateProgress(progress AttemptProgress) error {
 	result, err := r.db.sql.Exec(
 		`UPDATE runs SET output = ?, tokens_used = ?, session_checkpoint = ?
-		 WHERE id = ? AND status = ? AND owner_token = ? AND lease_expires_at > ?`,
+		 WHERE id = ? AND status = ? AND owner_token = ?
+		   AND julianday(lease_expires_at) > julianday('now')`,
 		progress.Output,
 		progress.TokensUsed,
 		progress.Checkpoint,
 		progress.RunID,
 		domain.RunRunning,
 		progress.OwnerToken,
-		progress.ObservedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("update run progress: %w", err)
@@ -192,17 +183,21 @@ func (r *AttemptRepo) UpdateProgress(progress AttemptProgress) error {
 func (r *AttemptRepo) RenewLease(
 	id int64,
 	ownerToken string,
-	now time.Time,
 	leaseDuration time.Duration,
 ) error {
+	if leaseDuration <= 0 {
+		return errors.New("attempt lease duration must be positive")
+	}
+	modifier := fmt.Sprintf("+%.9f seconds", leaseDuration.Seconds())
 	result, err := r.db.sql.Exec(
-		`UPDATE runs SET lease_expires_at = ?
-		 WHERE id = ? AND status = ? AND owner_token = ? AND lease_expires_at > ?`,
-		now.UTC().Add(leaseDuration).Format(time.RFC3339Nano),
+		`UPDATE runs
+		 SET lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+		 WHERE id = ? AND status = ? AND owner_token = ?
+		   AND julianday(lease_expires_at) > julianday('now')`,
+		modifier,
 		id,
 		domain.RunRunning,
 		ownerToken,
-		now.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("renew attempt lease: %w", err)
@@ -259,16 +254,12 @@ func (r *AttemptRepo) finishAttempt(
 		finishedAt = time.Now().UTC()
 	}
 	now := finishedAt.Format(time.RFC3339Nano)
-	leaseCheckedAt := params.LeaseCheckedAt
-	if leaseCheckedAt.IsZero() {
-		leaseCheckedAt = time.Now().UTC()
-	}
 	continuation := completion.Continuation()
 	var nextEligibleAt any
 	if eligibleAt := continuation.EligibleAt(); eligibleAt != nil {
 		nextEligibleAt = eligibleAt.UTC().Format(time.RFC3339Nano)
 	}
-	authorization, authorizationArgs := authorize(params, leaseCheckedAt)
+	authorization, authorizationArgs := authorize(params)
 	runArgs := []any{
 		state.RunStatus,
 		state.ExitReason,
@@ -344,17 +335,16 @@ func (r *AttemptRepo) finishAttempt(
 	return nil
 }
 
-func (r *AttemptRepo) NextExpired(now time.Time) (*domain.Run, error) {
+func (r *AttemptRepo) NextExpired() (*domain.Run, error) {
 	row := r.db.sql.QueryRow(
 		`SELECT id, task_id, session_id, status, exit_reason, output,
 		        tokens_used, token_budget, error, started_at, finished_at,
 		        owner_token, lease_expires_at, start_step, session_checkpoint
 		 FROM runs
-		 WHERE status = ? AND lease_expires_at <= ?
+		 WHERE status = ? AND julianday(lease_expires_at) <= julianday('now')
 		 ORDER BY lease_expires_at, id
 		 LIMIT 1`,
 		domain.RunRunning,
-		now.UTC().Format(time.RFC3339Nano),
 	)
 	return scanRunFrom(row)
 }
