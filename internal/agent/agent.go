@@ -77,6 +77,7 @@ type AttemptCheckpoint struct {
 	TokensUsed      int
 	TokensRemaining int
 	WindowOrigin    domain.ProviderWindowOrigin
+	HaltedAt        *time.Time
 	HaltReason      HaltReason
 	Error           string
 	Output          string
@@ -104,12 +105,14 @@ type SessionState struct {
 	AttemptOwnerToken     string                      `json:"attempt_owner_token,omitempty"`
 	AttemptStartStep      int                         `json:"attempt_start_step"`
 	AttemptHaltReason     HaltReason                  `json:"attempt_halt_reason,omitempty"`
+	AttemptHaltedAt       *time.Time                  `json:"attempt_halted_at,omitempty"`
 }
 
 type Session struct {
 	state   SessionState
 	dataDir string
 	noDelay bool
+	now     func() time.Time
 }
 
 type Option func(*Session)
@@ -117,6 +120,14 @@ type Option func(*Session)
 func WithNoDelay() Option {
 	return func(s *Session) {
 		s.noDelay = true
+	}
+}
+
+func WithNow(now func() time.Time) Option {
+	return func(s *Session) {
+		if now != nil {
+			s.now = now
+		}
 	}
 }
 
@@ -160,7 +171,7 @@ func Start(dataDir, taskTitle, taskDescription string, feedback []string, opts .
 		state.ErroredAt = failAt
 	}
 
-	s := &Session{state: state, dataDir: dataDir}
+	s := &Session{state: state, dataDir: dataDir, now: time.Now}
 	for _, o := range opts {
 		o(s)
 	}
@@ -181,7 +192,7 @@ func Load(dataDir, sessionID string, opts ...Option) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse session %s: %w", sessionID, err)
 	}
-	s := &Session{state: state, dataDir: dataDir}
+	s := &Session{state: state, dataDir: dataDir, now: time.Now}
 	for _, o := range opts {
 		o(s)
 	}
@@ -195,7 +206,7 @@ func Restore(dataDir, checkpoint string, opts ...Option) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse session checkpoint: %w", err)
 	}
-	s := &Session{state: state, dataDir: dataDir}
+	s := &Session{state: state, dataDir: dataDir, now: time.Now}
 	for _, o := range opts {
 		o(s)
 	}
@@ -277,6 +288,7 @@ func (s *Session) BindAttempt(runID int64, ownerToken string) error {
 	s.state.AttemptOwnerToken = ownerToken
 	s.state.AttemptStartStep = s.state.NextStep
 	s.state.AttemptHaltReason = HaltRunning
+	s.state.AttemptHaltedAt = nil
 	s.state.ErrorMessage = ""
 	if err := s.persist(); err != nil {
 		return fmt.Errorf("persist attempt binding: %w", err)
@@ -298,6 +310,11 @@ func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
 			s.state.TaskTitle,
 		))
 	}
+	var haltedAt *time.Time
+	if s.state.AttemptHaltedAt != nil {
+		value := *s.state.AttemptHaltedAt
+		haltedAt = &value
+	}
 	return AttemptCheckpoint{
 		RunID:           s.state.AttemptRunID,
 		OwnerToken:      s.state.AttemptOwnerToken,
@@ -306,6 +323,7 @@ func (s *Session) AttemptCheckpoint() AttemptCheckpoint {
 		TokensUsed:      s.state.TokensUsed,
 		TokensRemaining: s.state.TokensRemaining,
 		WindowOrigin:    s.state.AttemptWindowOrigin,
+		HaltedAt:        haltedAt,
 		HaltReason:      s.state.AttemptHaltReason,
 		Error:           s.state.ErrorMessage,
 		Output:          strings.Join(lines, "\n"),
@@ -468,6 +486,12 @@ func (s *Session) commitState(
 	change StateCommit,
 	description string,
 ) error {
+	terminal := s.state.AttemptHaltReason != "" &&
+		s.state.AttemptHaltReason != HaltRunning
+	if terminal && s.state.AttemptHaltedAt == nil {
+		haltedAt := s.now().UTC()
+		s.state.AttemptHaltedAt = &haltedAt
+	}
 	if commit != nil {
 		checkpoint, err := s.Checkpoint()
 		if err != nil {

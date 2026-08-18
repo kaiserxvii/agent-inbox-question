@@ -466,7 +466,39 @@ func TestResumeRejectsTokenExhaustedTaskBeforeReset(t *testing.T) {
 	}
 }
 
-func TestResumePreservesStoppedContinuationUntilConfigurationChanges(t *testing.T) {
+func TestAutomaticResumeRejectsAgentError(t *testing.T) {
+	deps, tasks, runs, _ := setupTest(t)
+	task := createTask(
+		t,
+		tasks,
+		"automatic agent error",
+		"[steps:1] [fail-at:1] [budget:5000]",
+	)
+	if err := Execute(context.Background(), deps, task.ID); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	history := listRuns(t, runs, task.ID)
+	if len(history) != 1 || history[0].ExitReason != domain.ExitAgentError {
+		t.Fatalf("history = %#v, want one agent-error run", history)
+	}
+
+	_, err := ResumeScheduled(
+		context.Background(),
+		deps,
+		task.ID,
+		history[0].ID,
+	)
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("automatic agent-error resume = %v, want ErrConflict", err)
+	}
+	if count, err := runs.CountByTask(task.ID); err != nil {
+		t.Fatalf("CountByTask: %v", err)
+	} else if count != 1 {
+		t.Errorf("runs = %d, want no automatic retry", count)
+	}
+}
+
+func TestResumeAllowsStoppedContinuationAfterReset(t *testing.T) {
 	deps, tasks, runs, _ := setupTest(t)
 	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
 	deps.Options = Options{
@@ -485,18 +517,27 @@ func TestResumePreservesStoppedContinuationUntilConfigurationChanges(t *testing.
 		t.Fatalf("next eligibility = %v, want %s", stopped.Continuation.EligibleAt(), wantEligible)
 	}
 
-	now = wantEligible.Add(time.Hour)
 	_, err := Resume(context.Background(), deps, task.ID)
-	if err == nil {
-		t.Fatal("Resume returned nil for a durably stopped continuation")
+	if err == nil || !strings.Contains(err.Error(), "cannot be resumed until") {
+		t.Fatalf("Resume before reset error = %v, want eligibility rejection", err)
 	}
-	if !strings.Contains(err.Error(), domain.AutoRetryNoProgressReason) {
-		t.Errorf("Resume error = %q, want durable stopped reason", err)
+
+	now = wantEligible
+	result, err := Resume(context.Background(), deps, task.ID)
+	if err != nil {
+		t.Fatalf("Resume after reset: %v", err)
+	}
+	if result.Outcome != domain.AttemptTokenExhausted {
+		t.Errorf("outcome = %q, want token exhaustion", result.Outcome)
+	}
+	after := getTask(t, tasks, task.ID)
+	if after.Continuation.Kind() != domain.ContinuationStopped {
+		t.Errorf("continuation = %q, want stopped after repeated failure", after.Continuation.Kind())
 	}
 	if count, err := runs.CountByTask(task.ID); err != nil {
 		t.Fatalf("CountByTask: %v", err)
-	} else if count != 1 {
-		t.Errorf("runs = %d, want 1", count)
+	} else if count != 2 {
+		t.Errorf("runs = %d, want two honest exhausted attempts", count)
 	}
 }
 

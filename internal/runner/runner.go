@@ -45,6 +45,21 @@ type attemptExpectation struct {
 	TaskID        int64
 	Status        domain.TaskStatus
 	PreviousRunID int64
+	Claim         resumeKind
+}
+
+type resumeKind int
+
+const (
+	manualResume resumeKind = iota
+	scheduledExhaustionResume
+	interruptedRecoveryResume
+)
+
+type resumeRequest struct {
+	taskID        int64
+	expectedRunID int64
+	kind          resumeKind
 }
 
 type leaseRenewal struct {
@@ -69,6 +84,17 @@ func restoreAttemptSession(
 		return agent.Restore(dataDir, checkpoint, opts...)
 	}
 	return agent.Load(dataDir, sessionID, opts...)
+}
+
+func sessionOptions(options Options) []agent.Option {
+	opts := []agent.Option{}
+	if options.NoDelay {
+		opts = append(opts, agent.WithNoDelay())
+	}
+	if options.Now != nil {
+		opts = append(opts, agent.WithNow(options.Now))
+	}
+	return opts
 }
 
 func bindOwnedSession(
@@ -120,9 +146,13 @@ func terminalizeCheckpoint(
 			checkpoint.HaltReason,
 		)
 	}
+	policyFinishedAt := finishedAt
+	if outcome == domain.AttemptTokenExhausted && checkpoint.HaltedAt != nil {
+		policyFinishedAt = checkpoint.HaltedAt.UTC()
+	}
 	completion, err := domain.DecideAttemptCompletion(domain.AttemptCompletionInput{
 		Outcome:       outcome,
-		FinishedAt:    finishedAt,
+		FinishedAt:    policyFinishedAt,
 		ResetInterval: resetInterval,
 		Progressed:    checkpoint.CompletedSteps > startStep,
 		WindowOrigin:  checkpoint.WindowOrigin,
@@ -220,10 +250,7 @@ func Execute(ctx context.Context, deps Deps, taskID int64) error {
 		})
 	}
 
-	var opts []agent.Option
-	if deps.Options.NoDelay {
-		opts = append(opts, agent.WithNoDelay())
-	}
+	opts := sessionOptions(deps.Options)
 	session, err := agent.Start(deps.DataDir, task.Title, task.Description, nil, opts...)
 	if err != nil {
 		return fmt.Errorf("start agent session: %w", err)
@@ -248,6 +275,41 @@ func Execute(ctx context.Context, deps Deps, taskID int64) error {
 // Resume atomically claims a failed task and records a new attempt against its
 // persisted agent session.
 func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error) {
+	return resume(ctx, deps, resumeRequest{taskID: taskID})
+}
+
+// ResumeScheduled resumes only the scheduled token-exhaustion run selected by
+// the automatic continuation server. Selection drift is reported as conflict.
+func ResumeScheduled(
+	ctx context.Context,
+	deps Deps,
+	taskID int64,
+	expectedRunID int64,
+) (AttemptResult, error) {
+	return resume(ctx, deps, resumeRequest{
+		taskID:        taskID,
+		expectedRunID: expectedRunID,
+		kind:          scheduledExhaustionResume,
+	})
+}
+
+// ResumeInterrupted resumes only the interrupted run just finalized by crash
+// recovery. Selection drift is reported as conflict.
+func ResumeInterrupted(
+	ctx context.Context,
+	deps Deps,
+	taskID int64,
+	expectedRunID int64,
+) (AttemptResult, error) {
+	return resume(ctx, deps, resumeRequest{
+		taskID:        taskID,
+		expectedRunID: expectedRunID,
+		kind:          interruptedRecoveryResume,
+	})
+}
+
+func resume(ctx context.Context, deps Deps, request resumeRequest) (AttemptResult, error) {
+	taskID := request.taskID
 	candidate, err := deps.Attempts.GetResumeCandidate(taskID)
 	if err != nil {
 		return AttemptResult{}, fmt.Errorf("get resume candidate for task %d: %w", taskID, err)
@@ -267,12 +329,21 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 	if candidate.RunID == 0 {
 		return AttemptResult{}, fmt.Errorf("task %d has no terminal run to resume", taskID)
 	}
-	if candidate.Continuation.Kind() == domain.ContinuationStopped {
-		return AttemptResult{}, fmt.Errorf(
-			"task %d cannot be resumed: %s",
-			taskID,
-			candidate.Continuation.Reason(),
-		)
+	if request.kind != manualResume {
+		expectedExitReason := domain.ExitTokenBudgetExhausted
+		if request.kind == interruptedRecoveryResume {
+			expectedExitReason = domain.ExitInterrupted
+		}
+		selectionChanged := candidate.RunID != request.expectedRunID ||
+			candidate.ExitReason != expectedExitReason ||
+			candidate.Continuation.Kind() != domain.ContinuationScheduled
+		if selectionChanged {
+			return AttemptResult{}, fmt.Errorf(
+				"%w: scheduled continuation for task %d changed",
+				domain.ErrConflict,
+				taskID,
+			)
+		}
 	}
 	now := time.Now().UTC()
 	if deps.Options.Now != nil {
@@ -280,6 +351,13 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 	}
 	nextEligibleAt := candidate.Continuation.EligibleAt()
 	if nextEligibleAt != nil && now.Before(*nextEligibleAt) {
+		if request.kind != manualResume {
+			return AttemptResult{}, fmt.Errorf(
+				"%w: scheduled continuation for task %d is no longer eligible",
+				domain.ErrConflict,
+				taskID,
+			)
+		}
 		return AttemptResult{}, fmt.Errorf(
 			"task %d cannot be resumed until %s (%s remaining)",
 			taskID,
@@ -288,10 +366,7 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 		)
 	}
 
-	var opts []agent.Option
-	if deps.Options.NoDelay {
-		opts = append(opts, agent.WithNoDelay())
-	}
+	opts := sessionOptions(deps.Options)
 	session, err := restoreAttemptSession(
 		deps.DataDir,
 		candidate.SessionID,
@@ -335,6 +410,7 @@ func Resume(ctx context.Context, deps Deps, taskID int64) (AttemptResult, error)
 			TaskID:        taskID,
 			Status:        domain.TaskFailed,
 			PreviousRunID: candidate.RunID,
+			Claim:         request.kind,
 		},
 	)
 	if err != nil {
@@ -474,7 +550,7 @@ func startAttempt(
 	if leaseDuration <= 0 {
 		leaseDuration = defaultLeaseDuration
 	}
-	return deps.Attempts.StartOwnedAttempt(store.StartAttemptParams{
+	params := store.StartAttemptParams{
 		TaskID:         expected.TaskID,
 		ExpectedStatus: expected.Status,
 		ExpectedRunID:  expected.PreviousRunID,
@@ -483,7 +559,15 @@ func startAttempt(
 		StartStep:      session.CompletedSteps(),
 		StartedAt:      time.Now().UTC(),
 		LeaseDuration:  leaseDuration,
-	})
+	}
+	switch expected.Claim {
+	case scheduledExhaustionResume:
+		return deps.Attempts.StartAutomaticAttempt(params)
+	case interruptedRecoveryResume:
+		return deps.Attempts.StartInterruptedAttempt(params)
+	default:
+		return deps.Attempts.StartOwnedAttempt(params)
+	}
 }
 
 func renewLease(

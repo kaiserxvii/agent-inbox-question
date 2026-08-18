@@ -29,10 +29,14 @@ type terminalCheckpointFixture struct {
 	session       *agent.Session
 	run           *domain.Run
 	resetInterval time.Duration
+	haltedAt      time.Time
 	recoveryAt    time.Time
 }
 
-func newTerminalCheckpointFixture(t *testing.T) *terminalCheckpointFixture {
+func newTerminalCheckpointFixture(
+	t *testing.T,
+	downtime time.Duration,
+) *terminalCheckpointFixture {
 	t.Helper()
 	dataDir := t.TempDir()
 	db, err := store.Open(dataDir)
@@ -45,6 +49,7 @@ func newTerminalCheckpointFixture(t *testing.T) *terminalCheckpointFixture {
 		}
 	})
 
+	recoveryAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
 	fixture := &terminalCheckpointFixture{
 		dataDir:       dataDir,
 		db:            db,
@@ -52,7 +57,8 @@ func newTerminalCheckpointFixture(t *testing.T) *terminalCheckpointFixture {
 		attempts:      store.NewAttemptRepo(db),
 		runs:          store.NewRunRepo(db),
 		resetInterval: time.Hour,
-		recoveryAt:    time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second),
+		haltedAt:      recoveryAt.Add(-downtime),
+		recoveryAt:    recoveryAt,
 	}
 	fixture.task, err = fixture.tasks.Create("two-window task", "[steps:2] [budget:400]")
 	if err != nil {
@@ -64,6 +70,7 @@ func newTerminalCheckpointFixture(t *testing.T) *terminalCheckpointFixture {
 		fixture.task.Description,
 		nil,
 		agent.WithNoDelay(),
+		agent.WithNow(func() time.Time { return fixture.haltedAt }),
 	)
 	if err != nil {
 		t.Fatalf("Start session: %v", err)
@@ -180,7 +187,7 @@ func waitForServer(t *testing.T, clock *fakeClock, description string) time.Dura
 }
 
 func TestServerContinuesPartialWindowAfterPreTerminalCommitCrash(t *testing.T) {
-	fixture := newTerminalCheckpointFixture(t)
+	fixture := newTerminalCheckpointFixture(t, 0)
 	_, err := fixture.runToExhaustion(true)
 	if !errors.Is(err, errCrashBeforeTerminalCommit) {
 		t.Fatalf("RunFenced error = %v, want simulated pre-terminal crash", err)
@@ -252,7 +259,7 @@ func TestServerContinuesPartialWindowAfterPreTerminalCommitCrash(t *testing.T) {
 }
 
 func TestServerRecoversTokenExhaustionPublishedBeforeFinalization(t *testing.T) {
-	fixture := newTerminalCheckpointFixture(t)
+	fixture := newTerminalCheckpointFixture(t, 0)
 	outcome, err := fixture.runToExhaustion(false)
 	if err != nil {
 		t.Fatalf("RunFenced: %v", err)
@@ -313,5 +320,35 @@ func TestServerRecoversTokenExhaustionPublishedBeforeFinalization(t *testing.T) 
 	}
 	if len(history) != 2 {
 		t.Fatalf("runs after continuation = %d, want expired attempt and reset continuation", len(history))
+	}
+}
+
+func TestServerUsesOriginalExhaustionTimeAfterLongDowntime(t *testing.T) {
+	fixture := newTerminalCheckpointFixture(t, 2*time.Hour)
+	outcome, err := fixture.runToExhaustion(false)
+	if err != nil {
+		t.Fatalf("RunFenced: %v", err)
+	}
+	if outcome.Kind != agent.TokenBudgetExhausted {
+		t.Fatalf("outcome = %d, want token exhaustion", outcome.Kind)
+	}
+
+	clock := fixture.startRecoveryServer(t)
+	if wait := waitForServer(t, clock, "continue after restart"); wait != 2*fixture.resetInterval {
+		t.Errorf("wait after overdue reset = %s, want scan interval %s", wait, 2*fixture.resetInterval)
+	}
+	completed, err := fixture.tasks.Get(fixture.task.ID)
+	if err != nil {
+		t.Fatalf("Get after restart: %v", err)
+	}
+	if completed.Status != domain.TaskDone {
+		t.Errorf("status after overdue reset = %q, want done", completed.Status)
+	}
+	history, err := fixture.runs.ListByTask(fixture.task.ID)
+	if err != nil {
+		t.Fatalf("ListByTask: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("runs after restart = %d, want recovered exhaustion and continuation", len(history))
 	}
 }

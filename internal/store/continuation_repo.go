@@ -11,6 +11,7 @@ import (
 
 type Continuation struct {
 	TaskID     int64
+	RunID      int64
 	EligibleAt time.Time
 }
 
@@ -41,17 +42,26 @@ func NewContinuationRepo(db *DB) *ContinuationRepo {
 
 func (r *ContinuationRepo) Next() (*Continuation, error) {
 	row := r.db.sql.QueryRow(
-		`SELECT id, next_eligible_at
+		`SELECT tasks.id, runs.id, tasks.next_eligible_at
 		 FROM tasks
-		 WHERE status = ? AND auto_retry_state = ? AND next_eligible_at IS NOT NULL
-		 ORDER BY next_eligible_at, id
+		 JOIN runs ON runs.id = (
+		   SELECT id FROM runs AS latest
+		   WHERE latest.task_id = tasks.id
+		   ORDER BY id DESC LIMIT 1
+		 )
+		 WHERE tasks.status = ?
+		   AND tasks.auto_retry_state = ?
+		   AND tasks.next_eligible_at IS NOT NULL
+		   AND runs.exit_reason = ?
+		 ORDER BY tasks.next_eligible_at, tasks.id
 		 LIMIT 1`,
 		domain.TaskFailed,
 		domain.ContinuationScheduled,
+		domain.ExitTokenBudgetExhausted,
 	)
 	var continuation Continuation
 	var eligibleAt string
-	if err := row.Scan(&continuation.TaskID, &eligibleAt); err != nil {
+	if err := row.Scan(&continuation.TaskID, &continuation.RunID, &eligibleAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrNotFound
 		}

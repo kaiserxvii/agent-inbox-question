@@ -200,10 +200,11 @@ Restoring a session is pure: it preserves configured allowance, remaining
 allowance, attempt usage, provider-window origin, and halt state exactly as
 checkpointed. Agent-error resumes start a fresh configured window.
 Token-exhausted resumes are rejected until their durable absolute eligibility
-timestamp, and a stopped continuation returns its durable reason instead of
-minting another identical window. Interrupted attempts resume immediately with
-only the allowance remaining in their current window and are marked as a
-continued window. The same not-before/stopped predicate is enforced again in the
+timestamp. A stopped continuation disables only automatic retry; an explicit
+manual resume may try again after that timestamp and records another honest
+failure if the configuration is still insufficient. Interrupted attempts resume
+immediately with only the allowance remaining in their current window and are
+marked as a continued window. The not-before predicate is enforced again in the
 atomic claim, closing races between the snapshot and the write.
 
 ### Server and reset model
@@ -219,6 +220,10 @@ whether automatic retry is scheduled or stopped. That timestamp is authoritative
 even if another process uses a different reset interval. `serve` initializes
 older unscheduled exhausted tasks from the terminal run's `finished_at` and its
 configured interval.
+
+Each scheduler selection includes the exact terminal run. Its atomic automatic
+claim requires that run to remain the latest scheduled token exhaustion; a human
+resume or any changed failure turns the stale selection into a benign rescan.
 
 Only genuine token exhaustion is retried automatically. Agent errors are terminal
 for automatic policy. Progress means a positive completed-step delta during the
@@ -256,10 +261,11 @@ SQLite WAL permits concurrent readers but still serializes writers; see SQLite's
 
 Each run stores an immutable-per-attempt session checkpoint in SQLite containing
 the run identity, run-start step, completed outputs, remaining allowance,
-provider-window origin, and explicit halt reason. The latest fenced run selects
-the authoritative checkpoint; the compatibility file under `sessions/` is never
-used to resume a checkpointed run. After a lease expires, `serve` reconciles the
-SQLite checkpoint before creating a replacement run:
+provider-window origin, explicit halt reason, and terminal observation time. The
+latest fenced run selects the authoritative checkpoint; the compatibility file
+under `sessions/` is never used to resume a checkpointed run. After a lease
+expires, `serve` reconciles the SQLite checkpoint before creating a replacement
+run:
 
 - completed checkpoints become succeeded runs;
 - token exhaustion becomes scheduled or stopped according to progress and
@@ -269,7 +275,8 @@ SQLite checkpoint before creating a replacement run:
 
 Terminal checkpoints are published before the subsequent atomic run/task
 finalization, so a crash between those writes preserves the correct recovery
-policy.
+policy. Token-reset eligibility is derived from the checkpoint's original
+exhaustion time, so downtime does not start a new reset interval.
 
 Therefore a stale executor can neither rewind its successor's recovery source nor
 publish another step after takeover. A crash after the database run is inserted

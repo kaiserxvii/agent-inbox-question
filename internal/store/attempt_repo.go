@@ -67,6 +67,14 @@ type AttemptProgress struct {
 
 type finishAuthorization func(FinishAttemptParams) (string, []any)
 
+type startAuthorization int
+
+const (
+	ownerStartAuthorization startAuthorization = iota
+	automaticStartAuthorization
+	interruptedStartAuthorization
+)
+
 func ownerFinishAuthorization(params FinishAttemptParams) (string, []any) {
 	return "owner_token = ? AND julianday(lease_expires_at) > julianday('now')", []any{
 		params.OwnerToken,
@@ -372,6 +380,31 @@ func (r *AttemptRepo) StartAttempt(
 }
 
 func (r *AttemptRepo) StartOwnedAttempt(params StartAttemptParams) (*domain.Run, error) {
+	return r.startOwnedAttempt(params, ownerStartAuthorization)
+}
+
+// StartAutomaticAttempt claims only the selected, scheduled token-exhaustion
+// failure. It returns ErrConflict when any part of that selection has changed.
+func (r *AttemptRepo) StartAutomaticAttempt(params StartAttemptParams) (*domain.Run, error) {
+	if params.ExpectedStatus != domain.TaskFailed || params.ExpectedRunID == 0 {
+		return nil, errors.New("automatic attempt requires an expected failed run")
+	}
+	return r.startOwnedAttempt(params, automaticStartAuthorization)
+}
+
+// StartInterruptedAttempt claims only the selected scheduled interruption
+// produced by crash recovery.
+func (r *AttemptRepo) StartInterruptedAttempt(params StartAttemptParams) (*domain.Run, error) {
+	if params.ExpectedStatus != domain.TaskFailed || params.ExpectedRunID == 0 {
+		return nil, errors.New("interrupted attempt requires an expected failed run")
+	}
+	return r.startOwnedAttempt(params, interruptedStartAuthorization)
+}
+
+func (r *AttemptRepo) startOwnedAttempt(
+	params StartAttemptParams,
+	authorization startAuthorization,
+) (*domain.Run, error) {
 	if err := domain.Transition(params.ExpectedStatus, domain.TaskInProgress); err != nil {
 		return nil, err
 	}
@@ -400,36 +433,62 @@ func (r *AttemptRepo) StartOwnedAttempt(params StartAttemptParams) (*domain.Run,
 	}
 	nowStr := now.Format(time.RFC3339Nano)
 	leaseExpiresAt := now.Add(params.LeaseDuration)
+	continuationPredicate := `(
+		? <> ?
+		OR next_eligible_at IS NULL
+		OR julianday(next_eligible_at) <= julianday(?)
+	)`
+	continuationArgs := []any{
+		params.ExpectedStatus,
+		domain.TaskFailed,
+		nowStr,
+	}
+	if authorization != ownerStartAuthorization {
+		expectedExitReason := domain.ExitTokenBudgetExhausted
+		if authorization == interruptedStartAuthorization {
+			expectedExitReason = domain.ExitInterrupted
+		}
+		continuationPredicate = `auto_retry_state = ?
+		AND next_eligible_at IS NOT NULL
+		AND julianday(next_eligible_at) <= julianday(?)
+		AND EXISTS (
+		  SELECT 1 FROM runs
+		  WHERE id = ? AND task_id = tasks.id AND exit_reason = ?
+		)`
+		continuationArgs = []any{
+			domain.ContinuationScheduled,
+			nowStr,
+			params.ExpectedRunID,
+			expectedExitReason,
+		}
+	}
+	claimArgs := []any{
+		domain.TaskInProgress,
+		nowStr,
+		params.TaskID,
+		params.ExpectedStatus,
+	}
+	claimArgs = append(claimArgs, continuationArgs...)
+	claimArgs = append(
+		claimArgs,
+		params.ExpectedRunID,
+		params.TaskID,
+		params.ExpectedRunID,
+		params.ExpectedRunID,
+		params.TaskID,
+	)
 	result, err := tx.Exec(
 		`UPDATE tasks
 		 SET status = ?, updated_at = ?, next_eligible_at = NULL,
 		     auto_retry_state = '', auto_retry_reason = ''
 		 WHERE id = ? AND status = ?
-		   AND (
-		     ? <> ?
-		     OR (
-		       auto_retry_state <> ?
-		       AND (next_eligible_at IS NULL OR julianday(next_eligible_at) <= julianday(?))
-		     )
-		   )
+		   AND (`+continuationPredicate+`)
 		   AND (
 		     (? = 0 AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id = ?))
 		     OR
 		     (? <> 0 AND ? = (SELECT id FROM runs WHERE task_id = ? ORDER BY id DESC LIMIT 1))
 		   )`,
-		domain.TaskInProgress,
-		nowStr,
-		params.TaskID,
-		params.ExpectedStatus,
-		params.ExpectedStatus,
-		domain.TaskFailed,
-		domain.ContinuationStopped,
-		nowStr,
-		params.ExpectedRunID,
-		params.TaskID,
-		params.ExpectedRunID,
-		params.ExpectedRunID,
-		params.TaskID,
+		claimArgs...,
 	)
 	if err != nil {
 		return rollback(fmt.Errorf("claim task: %w", err))
@@ -463,6 +522,13 @@ func (r *AttemptRepo) StartOwnedAttempt(params StartAttemptParams) (*domain.Run,
 				return rollback(domain.ErrNotFound)
 			}
 			return rollback(fmt.Errorf("read conflicting task status: %w", err))
+		}
+		if authorization != ownerStartAuthorization {
+			return rollback(fmt.Errorf(
+				"%w: selected continuation for task %d changed",
+				domain.ErrConflict,
+				params.TaskID,
+			))
 		}
 		if params.ExpectedStatus == domain.TaskFailed &&
 			observed == params.ExpectedStatus &&

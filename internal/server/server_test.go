@@ -422,6 +422,110 @@ func TestServerWaitsUntilEligibilityThenContinuesExhaustedTask(t *testing.T) {
 	}
 }
 
+func TestServerRescansWhenHumanConsumesSelectedContinuation(t *testing.T) {
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	tasks := store.NewTaskRepo(db)
+	attempts := store.NewAttemptRepo(db)
+	runs := store.NewRunRepo(db)
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	resetInterval := time.Hour
+	task, err := tasks.Create("two-window task", "[steps:2] [budget:400]")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	manualDeps := runner.Deps{
+		DataDir:  dataDir,
+		Tasks:    tasks,
+		Attempts: attempts,
+		Options: runner.Options{
+			NoDelay:       true,
+			Now:           func() time.Time { return now },
+			ResetInterval: resetInterval,
+		},
+	}
+	if err := runner.Execute(context.Background(), manualDeps, task.ID); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	clock := newFakeClock(now)
+	srv, err := New(
+		Config{ResetInterval: resetInterval, ScanInterval: 2 * resetInterval},
+		Dependencies{
+			DataDir:       dataDir,
+			Tasks:         tasks,
+			Attempts:      attempts,
+			Continuations: store.NewContinuationRepo(db),
+			Logger:        slog.New(slog.NewJSONHandler(io.Discard, nil)),
+			RunnerOptions: runner.Options{NoDelay: true},
+		},
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv.clock = clock
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		clock.Advance(0)
+		if err := <-done; err != nil {
+			t.Errorf("Run after cancellation: %v", err)
+		}
+	})
+
+	select {
+	case wait := <-clock.waiting:
+		if wait != resetInterval {
+			t.Errorf("initial wait = %s, want %s", wait, resetInterval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not select the scheduled continuation")
+	}
+
+	now = now.Add(resetInterval)
+	if _, err := runner.Resume(context.Background(), manualDeps, task.ID); err != nil {
+		t.Fatalf("human Resume: %v", err)
+	}
+	clock.Advance(resetInterval)
+	select {
+	case wait := <-clock.waiting:
+		if wait != 2*resetInterval {
+			t.Errorf("rescan wait = %s, want scan interval %s", wait, 2*resetInterval)
+		}
+	case err := <-done:
+		t.Fatalf("server exited after stale selection: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("server did not rescan after stale selection")
+	}
+
+	completed, err := tasks.Get(task.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if completed.Status != domain.TaskDone {
+		t.Errorf("status = %q, want human-completed task", completed.Status)
+	}
+	if count, err := runs.CountByTask(task.ID); err != nil {
+		t.Fatalf("CountByTask: %v", err)
+	} else if count != 2 {
+		t.Errorf("runs = %d, want no stale automatic attempt", count)
+	}
+}
+
 func TestServerContinuesAcrossRepeatedBudgetResetsUntilCompletion(t *testing.T) {
 	dataDir := t.TempDir()
 	db, err := store.Open(dataDir)
