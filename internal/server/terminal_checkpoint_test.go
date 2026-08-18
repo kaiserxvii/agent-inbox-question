@@ -258,6 +258,60 @@ func TestServerContinuesPartialWindowAfterPreTerminalCommitCrash(t *testing.T) {
 	}
 }
 
+func TestServerContinuesInterruptionRecoveredByPreviousProcess(t *testing.T) {
+	fixture := newTerminalCheckpointFixture(t, 0)
+	_, err := fixture.runToExhaustion(true)
+	if !errors.Is(err, errCrashBeforeTerminalCommit) {
+		t.Fatalf("RunFenced error = %v, want simulated pre-terminal crash", err)
+	}
+
+	time.Sleep(2 * terminalCheckpointLease)
+	expired, err := fixture.attempts.NextExpired()
+	if err != nil {
+		t.Fatalf("NextExpired: %v", err)
+	}
+	if err := runner.RecoverExpired(
+		runner.Deps{
+			DataDir:  fixture.dataDir,
+			Tasks:    fixture.tasks,
+			Attempts: fixture.attempts,
+		},
+		expired,
+		fixture.resetInterval,
+		fixture.recoveryAt,
+	); err != nil {
+		t.Fatalf("RecoverExpired: %v", err)
+	}
+
+	recovered, err := fixture.tasks.Get(fixture.task.ID)
+	if err != nil {
+		t.Fatalf("Get after recovery: %v", err)
+	}
+	if recovered.Status != domain.TaskFailed ||
+		recovered.Continuation.Kind() != domain.ContinuationScheduled {
+		t.Fatalf(
+			"recovered task = (%q, %q), want failed scheduled continuation",
+			recovered.Status,
+			recovered.Continuation.Kind(),
+		)
+	}
+
+	clock := fixture.startRecoveryServer(t)
+	if wait := waitForServer(t, clock, "continue the recovered interruption"); wait != fixture.resetInterval {
+		t.Errorf("wait after same-window exhaustion = %s, want %s", wait, fixture.resetInterval)
+	}
+
+	clock.Advance(fixture.resetInterval)
+	waitForServer(t, clock, "continue after the provider reset")
+	completed, err := fixture.tasks.Get(fixture.task.ID)
+	if err != nil {
+		t.Fatalf("Get after reset continuation: %v", err)
+	}
+	if completed.Status != domain.TaskDone {
+		t.Errorf("status after fresh reset window = %q, want done", completed.Status)
+	}
+}
+
 func TestServerRecoversTokenExhaustionPublishedBeforeFinalization(t *testing.T) {
 	fixture := newTerminalCheckpointFixture(t, 0)
 	outcome, err := fixture.runToExhaustion(false)

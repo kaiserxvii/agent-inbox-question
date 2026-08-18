@@ -117,22 +117,6 @@ func (s *Server) Run(ctx context.Context) error {
 				"task_id", expired.TaskID,
 				"run_id", expired.ID,
 			)
-			options := s.deps.RunnerOptions
-			options.Now = s.clock.Now
-			options.ResetInterval = s.config.ResetInterval
-			runnerDeps.Options = options
-			if _, err := runner.ResumeInterrupted(
-				ctx,
-				runnerDeps,
-				expired.TaskID,
-				expired.ID,
-			); err != nil && !errors.Is(err, domain.ErrConflict) {
-				return fmt.Errorf(
-					"continue recovered task %d: %w",
-					expired.TaskID,
-					err,
-				)
-			}
 			continue
 		}
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -175,12 +159,35 @@ func (s *Server) Run(ctx context.Context) error {
 		options := s.deps.RunnerOptions
 		options.Now = s.clock.Now
 		options.ResetInterval = s.config.ResetInterval
-		result, err := runner.ResumeScheduled(ctx, runner.Deps{
+		runnerDeps := runner.Deps{
 			DataDir:  s.deps.DataDir,
 			Tasks:    s.deps.Tasks,
 			Attempts: s.deps.Attempts,
 			Options:  options,
-		}, continuation.TaskID, continuation.RunID)
+		}
+		var result runner.AttemptResult
+		switch continuation.ExitReason {
+		case domain.ExitTokenBudgetExhausted:
+			result, err = runner.ResumeScheduled(
+				ctx,
+				runnerDeps,
+				continuation.TaskID,
+				continuation.RunID,
+			)
+		case domain.ExitInterrupted:
+			result, err = runner.ResumeInterrupted(
+				ctx,
+				runnerDeps,
+				continuation.TaskID,
+				continuation.RunID,
+			)
+		default:
+			return fmt.Errorf(
+				"continue task %d: unsupported exit reason %q",
+				continuation.TaskID,
+				continuation.ExitReason,
+			)
+		}
 		if err != nil {
 			if errors.Is(err, domain.ErrConflict) {
 				continue

@@ -221,8 +221,9 @@ even if another process uses a different reset interval. `serve` initializes
 older unscheduled exhausted tasks from the terminal run's `finished_at` and its
 configured interval.
 
-Each scheduler selection includes the exact terminal run. Its atomic automatic
-claim requires that run to remain the latest scheduled token exhaustion; a human
+Each scheduler selection includes the exact terminal run and its exit reason.
+Its atomic automatic claim requires that run to remain the latest compatible
+scheduled failure: either token exhaustion or a recovered interruption. A human
 resume or any changed failure turns the stale selection into a benign rescan.
 
 Only genuine token exhaustion is retried automatically. Agent errors are terminal
@@ -265,7 +266,8 @@ provider-window origin, explicit halt reason, and terminal observation time. The
 latest fenced run selects the authoritative checkpoint; the compatibility file
 under `sessions/` is never used to resume a checkpointed run. After a lease
 expires, `serve` reconciles the SQLite checkpoint before creating a replacement
-run:
+run. The recovered failure then re-enters the same durable continuation queue,
+so a second crash between reconciliation and resume cannot strand it:
 
 - completed checkpoints become succeeded runs;
 - token exhaustion becomes scheduled or stopped according to progress and
